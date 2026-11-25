@@ -4,8 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use engine_rhi::ash::vk;
 use engine_rhi::gpu_allocator::MemoryLocation;
 use engine_rhi::{
-    CoopMatrixTile, GpuBuffer, GpuImage, RhiDevice, RhiError, ash, is_f16_subgroup_coop_shape,
-    load_shader_words, sync,
+    CoopMatrixTile, FRAMES_IN_FLIGHT, GpuBuffer, GpuImage, RhiDevice, RhiError, ash,
+    is_f16_subgroup_coop_shape, load_shader_words, sync,
 };
 use thiserror::Error;
 
@@ -40,7 +40,8 @@ pub struct CoopMlPushConstants {
 pub struct CoopMlPipeline {
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
+    bound_views: [(vk::ImageView, vk::ImageView); FRAMES_IN_FLIGHT],
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     weight_buffer: Option<GpuBuffer>,
@@ -119,16 +120,20 @@ impl CoopMlPipeline {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(2)];
+            .descriptor_count(2 * FRAMES_IN_FLIGHT as u32)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
+            .max_sets(FRAMES_IN_FLIGHT as u32)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe { rhi.device.create_descriptor_pool(&pool_info, None)? };
 
+        let set_layouts = [descriptor_set_layout; FRAMES_IN_FLIGHT];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-        let descriptor_set = unsafe { rhi.device.allocate_descriptor_sets(&alloc_info)?[0] };
+            .set_layouts(&set_layouts);
+        let descriptor_sets_vec = unsafe { rhi.device.allocate_descriptor_sets(&alloc_info)? };
+        let descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT] = descriptor_sets_vec
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
 
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -161,7 +166,7 @@ impl CoopMlPipeline {
             .layout(pipeline_layout);
         let pipeline_res = unsafe {
             rhi.device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[pipe_info], None)
+                .create_compute_pipelines(rhi.pipeline_cache, &[pipe_info], None)
         };
         unsafe { rhi.device.destroy_shader_module(shader_module, None) };
         let pipeline = pipeline_res.map_err(|(_, e)| e)?[0];
@@ -182,7 +187,8 @@ impl CoopMlPipeline {
         Ok(Self {
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_set,
+            descriptor_sets,
+            bound_views: [(vk::ImageView::null(), vk::ImageView::null()); FRAMES_IN_FLIGHT],
             pipeline_layout,
             pipeline,
             weight_buffer: Some(weight_buffer),
@@ -200,9 +206,9 @@ impl CoopMlPipeline {
         self.active_tile != CoopMatrixTile::Fallback
     }
 
-    /// Dispatch the neural post-processing pass with default exposure (1.0) and residual strength (0.25).
+    /// Dispatch the neural post-processing pass on slot 0 with default exposure (1.0) and residual strength (0.25).
     pub fn dispatch(
-        &self,
+        &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         input_hdr: &GpuImage,
@@ -210,13 +216,48 @@ impl CoopMlPipeline {
         width: u32,
         height: u32,
     ) {
-        self.dispatch_with_params(device, cmd, input_hdr, output_image, width, height, 1.0, 0.25);
+        self.dispatch_slot_with_params(
+            device,
+            cmd,
+            input_hdr,
+            output_image,
+            width,
+            height,
+            1.0,
+            0.25,
+            0,
+        );
     }
 
-    /// Dispatch the neural post-processing pass with explicit exposure and residual strength.
+    /// Dispatch the neural post-processing pass for `frame_slot` with default exposure (1.0) and residual strength (0.25).
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_with_params(
-        &self,
+    pub fn dispatch_slot(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        input_hdr: &GpuImage,
+        output_image: &GpuImage,
+        width: u32,
+        height: u32,
+        frame_slot: usize,
+    ) {
+        self.dispatch_slot_with_params(
+            device,
+            cmd,
+            input_hdr,
+            output_image,
+            width,
+            height,
+            1.0,
+            0.25,
+            frame_slot,
+        );
+    }
+
+    /// Dispatch the neural post-processing pass with explicit exposure, residual strength, and frame slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_slot_with_params(
+        &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         input_hdr: &GpuImage,
@@ -225,26 +266,33 @@ impl CoopMlPipeline {
         height: u32,
         exposure: f32,
         residual_strength: f32,
+        frame_slot: usize,
     ) {
-        let in_info = [vk::DescriptorImageInfo::default()
-            .image_view(input_hdr.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let out_info = [vk::DescriptorImageInfo::default()
-            .image_view(output_image.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&in_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&out_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
+        let descriptor_set = self.descriptor_sets[slot];
+        let views = (input_hdr.view, output_image.view);
+        if self.bound_views[slot] != views {
+            let in_info = [vk::DescriptorImageInfo::default()
+                .image_view(input_hdr.view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let out_info = [vk::DescriptorImageInfo::default()
+                .image_view(output_image.view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&in_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&out_info),
+            ];
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            self.bound_views[slot] = views;
+        }
 
         let pre_barriers = [
             sync::image_barrier(
@@ -262,7 +310,7 @@ impl CoopMlPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::NONE,
+                vk::AccessFlags2::MEMORY_WRITE,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 output_image.subresource_range(),
@@ -290,7 +338,7 @@ impl CoopMlPipeline {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
-                &[self.descriptor_set],
+                &[descriptor_set],
                 &[],
             );
             device.cmd_push_constants(

@@ -171,7 +171,7 @@ impl NrdComposePass {
             .stage(stage)
             .layout(pipeline_layout)];
         let pipeline = unsafe {
-            let res = device.create_compute_pipelines(vk::PipelineCache::null(), &pipe_info, None);
+            let res = device.create_compute_pipelines(rhi.pipeline_cache, &pipe_info, None);
             device.destroy_shader_module(module, None);
             res.map_err(|(_, e)| e)?[0]
         };
@@ -280,6 +280,7 @@ impl NrdComposePass {
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         rt_pass: &RtGiPass,
+        frame_slot: usize,
     ) {
         let out_old_layout = if self.first_frame {
             vk::ImageLayout::UNDEFINED
@@ -327,7 +328,7 @@ impl NrdComposePass {
         )];
 
         let pc = ComposePushConstants {
-            params_ptr: rt_pass.params_buffer.device_address,
+            params_ptr: rt_pass.params_device_address(frame_slot),
         };
 
         unsafe {

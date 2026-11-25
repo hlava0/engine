@@ -1,11 +1,12 @@
 use engine_core::{Engine, create_demo_scene};
 
 #[test]
-fn full_engine_five_frames_headless() {
+fn full_engine_pipelined_frames_headless() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     const WIDTH: u32 = 128;
     const HEIGHT: u32 = 128;
+    const FRAMES: u32 = 12;
 
     let world = create_demo_scene(WIDTH, HEIGHT);
     let total_instances = world.instances.len() as u32;
@@ -17,16 +18,28 @@ fn full_engine_five_frames_headless() {
     );
 
     let mut last_draws = 0u32;
-    for frame in 0..5u32 {
+    let mut completed_gpu_frames = 0u32;
+    for frame in 0..FRAMES {
         let stats = engine.render_frame(1.0 / 60.0).expect("render_frame");
         println!(
             "Frame {frame}: cpu_record={:.1} us, draws={}/{}, gpu_timings={:?}",
             stats.cpu_record_us, stats.draw_count, total_instances, stats.gpu_timings
         );
         assert!(stats.cpu_record_us > 0.0);
-        assert!(!stats.gpu_timings.is_empty());
-        last_draws = stats.draw_count;
+        if !stats.gpu_timings.is_empty() {
+            completed_gpu_frames += 1;
+            last_draws = stats.draw_count;
+        }
     }
+
+    engine.wait_idle().expect("wait_idle");
+
+    assert!(
+        completed_gpu_frames >= FRAMES - 2,
+        "Expected at least {} completed GPU timing readbacks, got {}",
+        FRAMES - 2,
+        completed_gpu_frames
+    );
 
     // Demo scene has 8 instances including 1 behind camera and 1 occluded behind the wall
     assert!(
@@ -45,7 +58,10 @@ fn full_engine_five_frames_headless() {
         }
     }
     println!("Non-zero output pixels: {non_zero}/{}", pixels.len());
-    assert!(non_zero > pixels.len() / 4, "Expected substantial non-zero image");
+    assert!(
+        non_zero > pixels.len() / 4,
+        "Expected substantial non-zero image"
+    );
 
     assert_eq!(
         engine.validation_errors(),

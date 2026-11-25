@@ -1,7 +1,7 @@
 use ash::vk;
 use engine_gpu_driven::{GpuInstanceData, GpuMeshDrawInfo, GpuScene, GpuVertex};
 use engine_rhi::gpu_allocator::MemoryLocation;
-use engine_rhi::{GpuBuffer, RhiDevice, align_up, sync};
+use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, RhiDevice, align_up, sync};
 
 use crate::error::{Result, RtNrdError};
 
@@ -20,7 +20,7 @@ pub struct AccelStructureManager {
     pub tlas_device_address: u64,
     pub tlas_buffer: GpuBuffer,
     pub tlas_scratch: GpuBuffer,
-    pub tlas_instances_buffer: GpuBuffer,
+    pub tlas_instances_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub max_instances: u32,
     pub current_instances: u32,
     tlas_built_once: bool,
@@ -86,15 +86,21 @@ impl AccelStructureManager {
             (max_instances as usize * std::mem::size_of::<vk::AccelerationStructureInstanceKHR>())
                 as vk::DeviceSize;
 
-        let mut tlas_instances_buffer = GpuBuffer::new(
-            &device,
-            rhi.allocator_mut(),
-            "tlas-instances",
-            inst_buf_size,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-            MemoryLocation::CpuToGpu,
-        )?;
-        write_tlas_instances(&mut tlas_instances_buffer, instances, &blases)?;
+        let mut tlas_inst_vec = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for slot in 0..FRAMES_IN_FLIGHT {
+            tlas_inst_vec.push(GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                &format!("tlas-instances-{slot}"),
+                inst_buf_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                MemoryLocation::CpuToGpu,
+            )?);
+        }
+        let mut tlas_instances_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] = tlas_inst_vec
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        write_tlas_instances(&mut tlas_instances_buffers[0], instances, &blases)?;
 
         let tlas_geom = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::INSTANCES)
@@ -103,7 +109,7 @@ impl AccelStructureManager {
                 instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
                     .array_of_pointers(false)
                     .data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: tlas_instances_buffer.device_address,
+                        device_address: tlas_instances_buffers[0].device_address,
                     }),
             });
         let tlas_geoms = [tlas_geom];
@@ -210,7 +216,7 @@ impl AccelStructureManager {
             tlas_device_address,
             tlas_buffer,
             tlas_scratch,
-            tlas_instances_buffer,
+            tlas_instances_buffers,
             max_instances,
             current_instances: max_instances,
             tlas_built_once: true,
@@ -218,12 +224,21 @@ impl AccelStructureManager {
     }
 
     /// Update/refit the TLAS with updated instance transforms (zero allocations).
+    ///
+    /// Returns `Ok(false)` and skips GPU work cleanly when `any_transform_dirty == false`
+    /// and the TLAS has already been built.
     pub fn update_tlas(
         &mut self,
         rhi: &RhiDevice,
         cmd: vk::CommandBuffer,
         instances: &[GpuInstanceData],
-    ) -> Result<()> {
+        frame_slot: usize,
+        any_transform_dirty: bool,
+    ) -> Result<bool> {
+        if !any_transform_dirty && self.tlas_built_once {
+            return Ok(false);
+        }
+
         let as_device = rhi
             .acceleration_structure
             .as_ref()
@@ -237,13 +252,27 @@ impl AccelStructureManager {
             )));
         }
 
-        write_tlas_instances(&mut self.tlas_instances_buffer, instances, &self.blases)?;
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
+        write_tlas_instances(&mut self.tlas_instances_buffers[slot], instances, &self.blases)?;
         let count = instances.len() as u32;
         let use_update = self.tlas_built_once
             && count == self.current_instances
             && rhi.capabilities.vendor_profile.prefer_tlas_refit;
         self.current_instances = count;
         self.tlas_built_once = true;
+
+        // Order previous frame's ray-query reads and AS builds before writing TLAS/scratch
+        let pre_tlas = [sync::memory_barrier(
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
+                | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+        )];
+        unsafe {
+            sync::cmd_pipeline_barrier2(&rhi.device, cmd, &pre_tlas, &[], &[]);
+        }
 
         let scratch_align = rhi.capabilities.vendor_profile.min_as_scratch_alignment as u64;
         let tlas_scratch_addr = align_up(self.tlas_scratch.device_address, scratch_align);
@@ -255,7 +284,7 @@ impl AccelStructureManager {
                 instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
                     .array_of_pointers(false)
                     .data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: self.tlas_instances_buffer.device_address,
+                        device_address: self.tlas_instances_buffers[slot].device_address,
                     }),
             });
         let tlas_geoms = [tlas_geom];
@@ -308,7 +337,7 @@ impl AccelStructureManager {
             sync::cmd_pipeline_barrier2(&rhi.device, cmd, &tlas_to_compute, &[], &[]);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn destroy(self, rhi: &mut RhiDevice) -> Result<()> {
@@ -325,7 +354,9 @@ impl AccelStructureManager {
         }
         self.tlas_buffer.destroy(&device, alloc)?;
         self.tlas_scratch.destroy(&device, alloc)?;
-        self.tlas_instances_buffer.destroy(&device, alloc)?;
+        for buf in self.tlas_instances_buffers {
+            buf.destroy(&device, alloc)?;
+        }
 
         for blas in self.blases {
             unsafe {

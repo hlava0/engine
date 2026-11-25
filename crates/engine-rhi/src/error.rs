@@ -30,6 +30,9 @@ pub enum RhiError {
 
     #[error("CString conversion error: {0}")]
     NulError(#[from] std::ffi::NulError),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RhiError>;

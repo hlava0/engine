@@ -1,6 +1,6 @@
 use ash::vk;
 use engine_rhi::gpu_allocator::MemoryLocation;
-use engine_rhi::{GpuBuffer, GpuImage, RhiDevice, sync};
+use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, GpuImage, RhiDevice, sync};
 
 use crate::error::{Result, RtNrdError};
 use crate::ffi::{
@@ -67,7 +67,7 @@ pub struct NrdDenoiser {
     dummies_initialized: bool,
 
     samplers: Vec<vk::Sampler>,
-    cbufs: Vec<GpuBuffer>,
+    cbufs: [Vec<GpuBuffer>; FRAMES_IN_FLIGHT],
 
     set0_layout: vk::DescriptorSetLayout,
     set1_layout: vk::DescriptorSetLayout,
@@ -75,8 +75,14 @@ pub struct NrdDenoiser {
     pipelines: Vec<vk::Pipeline>,
 
     descriptor_pool: vk::DescriptorPool,
-    set0_list: Vec<vk::DescriptorSet>,
-    set1_list: Vec<vk::DescriptorSet>,
+    set0_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT],
+    set1_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT],
+
+    // Reusable per-frame scratch buffers to avoid hot-loop heap allocations
+    dispatches_scratch: Vec<NrdDispatchInfo>,
+    resources_scratch: Vec<NrdResourceBinding>,
+    tex_infos_scratch: Vec<vk::DescriptorImageInfo>,
+    store_infos_scratch: Vec<vk::DescriptorImageInfo>,
 
     max_tex_slots: u32,
     max_store_slots: u32,
@@ -241,19 +247,26 @@ impl NrdDenoiser {
             "nrd-dummy-storage",
         )?;
 
-        // Persistent host-visible constant buffers (one per dispatch slot)
+        // Persistent host-visible constant buffers ring-buffered per frame-in-flight slot
         let cb_size = (inst_info.constant_buffer_max_data_size as u64).max(256);
-        let mut cbufs = Vec::with_capacity(MAX_DISPATCHES);
-        for i in 0..MAX_DISPATCHES {
-            cbufs.push(GpuBuffer::new(
-                &device,
-                rhi.allocator_mut(),
-                &format!("nrd-cbuf-{i}"),
-                cb_size,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                MemoryLocation::CpuToGpu,
-            )?);
+        let mut cbufs_slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for slot in 0..FRAMES_IN_FLIGHT {
+            let mut slot_cbufs = Vec::with_capacity(MAX_DISPATCHES);
+            for i in 0..MAX_DISPATCHES {
+                slot_cbufs.push(GpuBuffer::new(
+                    &device,
+                    rhi.allocator_mut(),
+                    &format!("nrd-cbuf-s{slot}-{i}"),
+                    cb_size,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                )?);
+            }
+            cbufs_slots.push(slot_cbufs);
         }
+        let cbufs: [Vec<GpuBuffer>; FRAMES_IN_FLIGHT] = cbufs_slots
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
 
         // Shared descriptor set layouts matching NRD's SPIR-V binding offsets
         let max_tex_slots = inst_info.per_set_textures_max_num.max(1);
@@ -353,91 +366,106 @@ impl NrdDenoiser {
                 .stage(stage)
                 .layout(pipeline_layout)];
             let pipe = unsafe {
-                let res = device.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+                let res = device.create_compute_pipelines(rhi.pipeline_cache, &info, None);
                 device.destroy_shader_module(module, None);
                 res.map_err(|(_, e)| e)?[0]
             };
             pipelines.push(pipe);
         }
 
-        // Pre-allocate descriptor pool & sets for MAX_DISPATCHES
+        // Pre-allocate descriptor pool & per-slot sets for MAX_DISPATCHES * FRAMES_IN_FLIGHT
+        let total_dispatches = MAX_DISPATCHES as u32 * FRAMES_IN_FLIGHT as u32;
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: MAX_DISPATCHES as u32 * max_tex_slots,
+                descriptor_count: total_dispatches * max_tex_slots,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: MAX_DISPATCHES as u32 * max_store_slots,
+                descriptor_count: total_dispatches * max_store_slots,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: MAX_DISPATCHES as u32,
+                descriptor_count: total_dispatches,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: MAX_DISPATCHES as u32 * samplers.len() as u32,
+                descriptor_count: total_dispatches * samplers.len() as u32,
             },
         ];
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(MAX_DISPATCHES as u32 * 2)
+                    .max_sets(total_dispatches * 2)
                     .pool_sizes(&pool_sizes),
                 None,
             )?
         };
 
         let set0_layouts = vec![set0_layout; MAX_DISPATCHES];
-        let set0_list = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&set0_layouts),
-            )?
-        };
-
         let set1_layouts = vec![set1_layout; MAX_DISPATCHES];
-        let set1_list = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&set1_layouts),
-            )?
-        };
+        let mut set0_slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut set1_slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
 
-        // Pre-populate Set 1 (persistent constant buffer + immutable sampler bindings)
-        for (d, &set1) in set1_list.iter().enumerate() {
-            let buf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(cbufs[d].buffer)
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            let sampler_infos: Vec<vk::DescriptorImageInfo> = samplers
-                .iter()
-                .map(|&s| vk::DescriptorImageInfo::default().sampler(s))
-                .collect();
+        for slot_cbufs in &cbufs {
+            let set0_list = unsafe {
+                device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&set0_layouts),
+                )?
+            };
+            let set1_list = unsafe {
+                device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&set1_layouts),
+                )?
+            };
 
-            let mut writes = Vec::with_capacity(1 + sampler_infos.len());
-            writes.push(
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set1)
-                    .dst_binding(cb_binding)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&buf_info),
-            );
-            for (s, info) in sampler_infos.iter().enumerate() {
+            // Pre-populate Set 1 (persistent per-slot constant buffer + immutable sampler bindings)
+            for (d, &set1) in set1_list.iter().enumerate() {
+                let buf_info = [vk::DescriptorBufferInfo::default()
+                    .buffer(slot_cbufs[d].buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+                let sampler_infos: Vec<vk::DescriptorImageInfo> = samplers
+                    .iter()
+                    .map(|&s| vk::DescriptorImageInfo::default().sampler(s))
+                    .collect();
+
+                let mut writes = Vec::with_capacity(1 + sampler_infos.len());
                 writes.push(
                     vk::WriteDescriptorSet::default()
                         .dst_set(set1)
-                        .dst_binding(sampler_base + s as u32)
-                        .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(std::slice::from_ref(info)),
+                        .dst_binding(cb_binding)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&buf_info),
                 );
+                for (s, info) in sampler_infos.iter().enumerate() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set1)
+                            .dst_binding(sampler_base + s as u32)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(std::slice::from_ref(info)),
+                    );
+                }
+                unsafe {
+                    device.update_descriptor_sets(&writes, &[]);
+                }
             }
-            unsafe {
-                device.update_descriptor_sets(&writes, &[]);
-            }
+
+            set0_slots.push(set0_list);
+            set1_slots.push(set1_list);
         }
+
+        let set0_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] = set0_slots
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        let set1_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] = set1_slots
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
 
         let perm_states = vec![TrackedImageState::default(); perm_pool.len()];
         let trans_states = vec![TrackedImageState::default(); trans_pool.len()];
@@ -464,8 +492,12 @@ impl NrdDenoiser {
             pipeline_layout,
             pipelines,
             descriptor_pool,
-            set0_list,
-            set1_list,
+            set0_per_slot,
+            set1_per_slot,
+            dispatches_scratch: vec![NrdDispatchInfo::default(); MAX_DISPATCHES],
+            resources_scratch: vec![NrdResourceBinding::default(); MAX_RESOURCES_PER_FRAME],
+            tex_infos_scratch: Vec::with_capacity(max_tex_slots as usize),
+            store_infos_scratch: Vec::with_capacity(max_store_slots as usize),
             max_tex_slots,
             max_store_slots,
             tex_offset,
@@ -474,8 +506,8 @@ impl NrdDenoiser {
         })
     }
 
-    /// Configure NRD settings, update persistent constant buffers, and record all NRD compute dispatches
-    /// with fine-grained `Synchronization2` barriers.
+    /// Configure NRD settings, update persistent constant buffers for `frame_slot`,
+    /// and record all NRD compute dispatches with fine-grained `Synchronization2` barriers.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -491,7 +523,9 @@ impl NrdDenoiser {
         denoising_range: f32,
         time_delta_ms: f32,
         reset_history: bool,
+        frame_slot: usize,
     ) -> Result<()> {
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
         if !self.dummies_initialized {
             let init_dummies = [
                 sync::image_barrier(
@@ -560,8 +594,6 @@ impl NrdDenoiser {
             return Err(RtNrdError::Nrd(res));
         }
 
-        let mut dispatches = vec![NrdDispatchInfo::default(); MAX_DISPATCHES];
-        let mut resources = vec![NrdResourceBinding::default(); MAX_RESOURCES_PER_FRAME];
         let mut dispatch_count = 0u32;
         let mut resource_count = 0u32;
 
@@ -569,11 +601,11 @@ impl NrdDenoiser {
             nrd_shim_get_compute_dispatches(
                 self.instance,
                 0,
-                dispatches.as_mut_ptr(),
-                dispatches.len() as u32,
+                self.dispatches_scratch.as_mut_ptr(),
+                self.dispatches_scratch.len() as u32,
                 &mut dispatch_count,
-                resources.as_mut_ptr(),
-                resources.len() as u32,
+                self.resources_scratch.as_mut_ptr(),
+                self.resources_scratch.len() as u32,
                 &mut resource_count,
             )
         };
@@ -592,7 +624,8 @@ impl NrdDenoiser {
             access: vk::AccessFlags2::SHADER_SAMPLED_READ,
         };
 
-        for (d, dd) in dispatches.iter().enumerate().take(dispatch_count as usize) {
+        for d in 0..(dispatch_count as usize) {
+            let dd = self.dispatches_scratch[d];
 
             if !dd.constant_buffer_data.is_null() && dd.constant_buffer_data_size > 0 {
                 let src = unsafe {
@@ -601,7 +634,7 @@ impl NrdDenoiser {
                         dd.constant_buffer_data_size as usize,
                     )
                 };
-                let dst = self.cbufs[d].mapped_slice_mut()?;
+                let dst = self.cbufs[slot][d].mapped_slice_mut()?;
                 dst[..src.len()].copy_from_slice(src);
             }
 
@@ -610,10 +643,8 @@ impl NrdDenoiser {
             };
 
             let mut barriers: Vec<vk::ImageMemoryBarrier2<'_>> = Vec::with_capacity(dd_res.len());
-            let mut tex_infos: Vec<vk::DescriptorImageInfo> =
-                Vec::with_capacity(self.max_tex_slots as usize);
-            let mut store_infos: Vec<vk::DescriptorImageInfo> =
-                Vec::with_capacity(self.max_store_slots as usize);
+            self.tex_infos_scratch.clear();
+            self.store_infos_scratch.clear();
 
             for rb in dd_res {
                 let is_storage = rb.descriptor_type == NRD_DESCRIPTOR_STORAGE_TEXTURE;
@@ -702,41 +733,46 @@ impl NrdDenoiser {
                     .image_view(view)
                     .image_layout(req_layout);
                 if is_storage {
-                    store_infos.push(info);
+                    self.store_infos_scratch.push(info);
                 } else {
-                    tex_infos.push(info);
+                    self.tex_infos_scratch.push(info);
                 }
             }
 
-            while tex_infos.len() < self.max_tex_slots as usize {
-                tex_infos.push(
+            while self.tex_infos_scratch.len() < self.max_tex_slots as usize {
+                self.tex_infos_scratch.push(
                     vk::DescriptorImageInfo::default()
                         .image_view(self.dummy_sampled.view)
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
                 );
             }
-            while store_infos.len() < self.max_store_slots as usize {
-                store_infos.push(
+            while self.store_infos_scratch.len() < self.max_store_slots as usize {
+                self.store_infos_scratch.push(
                     vk::DescriptorImageInfo::default()
                         .image_view(self.dummy_storage.view)
                         .image_layout(vk::ImageLayout::GENERAL),
                 );
             }
 
-            let mut writes = Vec::with_capacity(tex_infos.len() + store_infos.len());
-            for (t, info) in tex_infos.iter().enumerate() {
+            let set0 = self.set0_per_slot[slot][d];
+            let set1 = self.set1_per_slot[slot][d];
+
+            let mut writes = Vec::with_capacity(
+                self.tex_infos_scratch.len() + self.store_infos_scratch.len(),
+            );
+            for (t, info) in self.tex_infos_scratch.iter().enumerate() {
                 writes.push(
                     vk::WriteDescriptorSet::default()
-                        .dst_set(self.set0_list[d])
+                        .dst_set(set0)
                         .dst_binding(self.tex_offset + t as u32)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(std::slice::from_ref(info)),
                 );
             }
-            for (s, info) in store_infos.iter().enumerate() {
+            for (s, info) in self.store_infos_scratch.iter().enumerate() {
                 writes.push(
                     vk::WriteDescriptorSet::default()
-                        .dst_set(self.set0_list[d])
+                        .dst_set(set0)
                         .dst_binding(self.store_offset + s as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(std::slice::from_ref(info)),
@@ -758,7 +794,7 @@ impl NrdDenoiser {
                     vk::PipelineBindPoint::COMPUTE,
                     self.pipeline_layout,
                     0,
-                    &[self.set0_list[d], self.set1_list[d]],
+                    &[set0, set1],
                     &[],
                 );
                 device.cmd_dispatch(cmd, dd.grid_width as u32, dd.grid_height as u32, 1);
@@ -810,8 +846,10 @@ impl NrdDenoiser {
         }
 
         let alloc = rhi.allocator_mut();
-        for cb in self.cbufs {
-            cb.destroy(&device, alloc)?;
+        for slot_cbufs in self.cbufs {
+            for cb in slot_cbufs {
+                cb.destroy(&device, alloc)?;
+            }
         }
         for img in self.perm_pool {
             img.destroy(&device, alloc)?;

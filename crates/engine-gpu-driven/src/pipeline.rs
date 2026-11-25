@@ -216,7 +216,7 @@ impl GpuDrivenPipeline {
         )?;
 
         // 3. G-buffer Dynamic Rendering graphics pipeline
-        let (geom_layout, geom_pipeline) = create_gbuffer_pipeline(device)?;
+        let (geom_layout, geom_pipeline) = create_gbuffer_pipeline(rhi)?;
 
         Ok(Self {
             targets,
@@ -235,6 +235,7 @@ impl GpuDrivenPipeline {
     /// 1. Clear draw_count -> cull.comp
     /// 2. Indirect G-buffer pass (`vkCmdDrawIndexedIndirectCount`, Dynamic Rendering, Reverse-Z)
     /// 3. Hi-Z mip pyramid generation (`hiz_downsample.comp`)
+    #[allow(clippy::too_many_arguments)]
     pub fn record_frame(
         &mut self,
         rhi: &RhiDevice,
@@ -243,26 +244,67 @@ impl GpuDrivenPipeline {
         scene: &mut GpuScene,
         uniforms: &FrameUniforms,
         enable_hiz: bool,
+        frame_slot: usize,
     ) -> Result<()> {
-        scene.update_frame_uniforms(uniforms)?;
+        scene.update_frame_uniforms(frame_slot, uniforms)?;
         let device = &rhi.device;
         let extent = self.targets.extent;
+        let draw_count_buf = scene.draw_count_buffer(frame_slot);
+        let draw_count_vk = draw_count_buf.buffer;
+        let draw_count_addr = draw_count_buf.device_address;
+        let frame_uniforms_addr = scene.frame_uniforms_address(frame_slot);
 
         // 1. Clear draw_count to 0 and barrier before cull.comp
         unsafe {
-            device.cmd_fill_buffer(cmd, scene.draw_count_buffer.buffer, 0, 4, 0);
+            device.cmd_fill_buffer(cmd, draw_count_vk, 0, 4, 0);
         }
-        let fill_barrier = [sync::buffer_barrier(
-            scene.draw_count_buffer.buffer,
-            0,
-            4,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        )];
-        unsafe {
-            sync::cmd_pipeline_barrier2(device, cmd, &[], &fill_barrier, &[]);
+        if self.first_frame {
+            let fill_barrier = [sync::buffer_barrier(
+                draw_count_vk,
+                0,
+                4,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            )];
+            unsafe {
+                sync::cmd_pipeline_barrier2(device, cmd, &[], &fill_barrier, &[]);
+            }
+        } else {
+            // Order previous frame's indirect draw & vertex reads before this frame's cull writes
+            let pre_cull_barriers = [
+                sync::buffer_barrier(
+                    draw_count_vk,
+                    0,
+                    4,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                ),
+                sync::buffer_barrier(
+                    scene.indirect_draw_buffer.buffer,
+                    0,
+                    scene.indirect_draw_buffer.size,
+                    vk::PipelineStageFlags2::DRAW_INDIRECT,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                ),
+                sync::buffer_barrier(
+                    scene.draw_instance_ids_buffer.buffer,
+                    0,
+                    scene.draw_instance_ids_buffer.size,
+                    vk::PipelineStageFlags2::VERTEX_SHADER,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                ),
+            ];
+            unsafe {
+                sync::cmd_pipeline_barrier2(device, cmd, &[], &pre_cull_barriers, &[]);
+            }
         }
 
         // Dispatch cull.comp
@@ -271,11 +313,11 @@ impl GpuDrivenPipeline {
             cull_flags |= CULL_FLAG_HIZ;
         }
         let cull_pc = CullPushConstants {
-            frame_uniforms_ptr: scene.frame_uniforms_buffer.device_address,
+            frame_uniforms_ptr: frame_uniforms_addr,
             instances_ptr: scene.instance_buffer.device_address,
             meshes_ptr: scene.mesh_buffer.device_address,
             indirect_draws_ptr: scene.indirect_draw_buffer.device_address,
-            draw_count_ptr: scene.draw_count_buffer.device_address,
+            draw_count_ptr: draw_count_addr,
             draw_instance_ids_ptr: scene.draw_instance_ids_buffer.device_address,
             instance_count: scene.instance_count,
             hiz_bindless_index: BINDLESS_TEX_HIZ_FULL,
@@ -315,7 +357,7 @@ impl GpuDrivenPipeline {
                 vk::AccessFlags2::INDIRECT_COMMAND_READ,
             ),
             sync::buffer_barrier(
-                scene.draw_count_buffer.buffer,
+                draw_count_vk,
                 0,
                 4,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
@@ -334,15 +376,24 @@ impl GpuDrivenPipeline {
             ),
         ];
 
-        let color_src_stage = if self.first_frame {
-            vk::PipelineStageFlags2::TOP_OF_PIPE
+        let (color_src_stage, color_src_access) = if self.first_frame {
+            (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE)
         } else {
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+            (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
         };
-        let depth_src_stage = if self.first_frame {
-            vk::PipelineStageFlags2::TOP_OF_PIPE
+        let (depth_src_stage, depth_src_access) = if self.first_frame {
+            (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE)
         } else {
-            vk::PipelineStageFlags2::COMPUTE_SHADER
+            (
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
         };
 
         let gbuf_img_barriers = [
@@ -351,7 +402,7 @@ impl GpuDrivenPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 color_src_stage,
-                vk::AccessFlags2::NONE,
+                color_src_access,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 self.targets.albedo_metallic.subresource_range(),
@@ -361,7 +412,7 @@ impl GpuDrivenPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 color_src_stage,
-                vk::AccessFlags2::NONE,
+                color_src_access,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 self.targets.normal_roughness.subresource_range(),
@@ -371,7 +422,7 @@ impl GpuDrivenPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 color_src_stage,
-                vk::AccessFlags2::NONE,
+                color_src_access,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 self.targets.motion.subresource_range(),
@@ -381,7 +432,7 @@ impl GpuDrivenPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 color_src_stage,
-                vk::AccessFlags2::NONE,
+                color_src_access,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 self.targets.view_z.subresource_range(),
@@ -391,7 +442,7 @@ impl GpuDrivenPipeline {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
                 depth_src_stage,
-                vk::AccessFlags2::NONE,
+                depth_src_access,
                 vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                     | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
@@ -474,7 +525,7 @@ impl GpuDrivenPipeline {
         }];
 
         let geom_pc = GeomPushConstants {
-            frame_uniforms_ptr: scene.frame_uniforms_buffer.device_address,
+            frame_uniforms_ptr: frame_uniforms_addr,
             vertices_ptr: scene.vertex_buffer.device_address,
             instances_ptr: scene.instance_buffer.device_address,
             draw_instance_ids_ptr: scene.draw_instance_ids_buffer.device_address,
@@ -497,7 +548,7 @@ impl GpuDrivenPipeline {
                 cmd,
                 scene.indirect_draw_buffer.buffer,
                 0,
-                scene.draw_count_buffer.buffer,
+                draw_count_vk,
                 0,
                 scene.instance_count,
                 std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
@@ -665,7 +716,7 @@ fn create_compute_pipeline(
     let info = [vk::ComputePipelineCreateInfo::default()
         .stage(stage)
         .layout(layout)];
-    let pipe_res = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &info, None) };
+    let pipe_res = unsafe { device.create_compute_pipelines(rhi.pipeline_cache, &info, None) };
     unsafe { device.destroy_shader_module(module, None) };
 
     match pipe_res {
@@ -677,7 +728,8 @@ fn create_compute_pipeline(
     }
 }
 
-fn create_gbuffer_pipeline(device: &ash::Device) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+fn create_gbuffer_pipeline(rhi: &RhiDevice) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+    let device = &rhi.device;
     let vert_words = load_shader_words("gbuffer.vert")?;
     let frag_words = load_shader_words("gbuffer.frag")?;
 
@@ -775,7 +827,7 @@ fn create_gbuffer_pipeline(device: &ash::Device) -> Result<(vk::PipelineLayout, 
         .push_next(&mut rendering_info)];
 
     let pipe_res =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &gfx_info, None) };
+        unsafe { device.create_graphics_pipelines(rhi.pipeline_cache, &gfx_info, None) };
     unsafe {
         device.destroy_shader_module(vert_module, None);
         device.destroy_shader_module(frag_module, None);

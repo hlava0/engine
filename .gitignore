@@ -1,4 +1,5 @@
-/target
+target/
+pipeline_cache_*.bin
 *.spv
 .DS_Store
 .idea/

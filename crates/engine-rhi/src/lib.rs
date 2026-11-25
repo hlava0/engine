@@ -5,17 +5,22 @@ pub mod buffer;
 pub mod device;
 pub mod error;
 pub mod image;
+pub mod pipeline_cache;
 pub mod sync;
 pub mod vendor;
 
 pub use ash;
 pub use gpu_allocator;
 
+/// Number of frames kept in flight concurrently for CPU/GPU async pipelining.
+pub const FRAMES_IN_FLIGHT: usize = 2;
+
 pub use bindless::{BindlessConfig, BindlessTable};
 pub use buffer::GpuBuffer;
 pub use device::{CooperativeMatrixProps, DeviceCapabilities, QueueFamilyIndices, RhiConfig, RhiDevice};
 pub use error::{Result, RhiError};
 pub use image::GpuImage;
+pub use pipeline_cache::PipelineCache;
 pub use vendor::{
     CoopMatrixTile, GpuVendor, VendorProbeInput, VendorProfile, align_up,
     is_f16_subgroup_coop_shape,

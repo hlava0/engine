@@ -192,23 +192,28 @@ impl SceneWorld {
         (vertices, indices, draw_infos)
     }
 
+    /// Fill a caller-owned scratch vector with `GpuInstanceData` (zero heap allocation when pre-sized).
+    pub fn fill_gpu_instances(&self, out: &mut Vec<GpuInstanceData>) {
+        out.clear();
+        for inst in &self.instances {
+            let mat = self.materials[inst.material_id as usize];
+            out.push(GpuInstanceData {
+                model: inst.transform,
+                prev_model: inst.prev_transform,
+                albedo_metallic: [mat.albedo[0], mat.albedo[1], mat.albedo[2], mat.metallic],
+                mesh_id: inst.mesh_id,
+                material_id: inst.material_id,
+                roughness: mat.roughness,
+                _pad: 0,
+            });
+        }
+    }
+
     /// Build `GpuInstanceData` array matching current `instances` and `materials`.
     pub fn gpu_instances(&self) -> Vec<GpuInstanceData> {
-        self.instances
-            .iter()
-            .map(|inst| {
-                let mat = self.materials[inst.material_id as usize];
-                GpuInstanceData {
-                    model: inst.transform,
-                    prev_model: inst.prev_transform,
-                    albedo_metallic: [mat.albedo[0], mat.albedo[1], mat.albedo[2], mat.metallic],
-                    mesh_id: inst.mesh_id,
-                    material_id: inst.material_id,
-                    roughness: mat.roughness,
-                    _pad: 0,
-                }
-            })
-            .collect()
+        let mut out = Vec::with_capacity(self.instances.len());
+        self.fill_gpu_instances(&mut out);
+        out
     }
 
     /// Build `GpuRtMaterial` array for ray tracing.
@@ -244,21 +249,38 @@ impl SceneWorld {
         GpuScene::new(rhi, &vertices, &indices, &meshes, &instances)
     }
 
-    /// Sync changed/animated instance transforms and frame uniforms to `GpuScene`.
+    /// Sync changed/animated instance transforms and frame uniforms to `GpuScene` for `frame_slot`.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_to_gpu(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         scene: &mut GpuScene,
+        gpu_instances: &[GpuInstanceData],
         width: u32,
         height: u32,
+        frame_slot: usize,
+        is_first_frame: bool,
     ) -> Result<FrameUniforms, engine_rhi::RhiError> {
         self.camera.update(width, height);
 
         if self.dirty_instances {
-            let gpu_insts = self.gpu_instances();
-            let bytes = bytemuck::cast_slice(&gpu_insts);
+            let bytes = bytemuck::cast_slice(gpu_instances);
             if !bytes.is_empty() && bytes.len() <= 65536 {
+                if !is_first_frame {
+                    // Order previous frame's cull/vertex reads before overwriting instance_buffer
+                    let pre_update = [sync::buffer_barrier(
+                        scene.instance_buffer.buffer,
+                        0,
+                        bytes.len() as vk::DeviceSize,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                            | vk::PipelineStageFlags2::VERTEX_SHADER,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    )];
+                    unsafe { sync::cmd_pipeline_barrier2(device, cmd, &[], &pre_update, &[]) };
+                }
                 unsafe {
                     device.cmd_update_buffer(cmd, scene.instance_buffer.buffer, 0, bytes);
                 }
@@ -291,7 +313,7 @@ impl SceneWorld {
             screen_size: [width, height],
             hiz_size: [width, height],
         };
-        scene.update_frame_uniforms(&uniforms)?;
+        scene.update_frame_uniforms(frame_slot, &uniforms)?;
         Ok(uniforms)
     }
 }

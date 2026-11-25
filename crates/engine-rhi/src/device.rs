@@ -8,6 +8,7 @@ use gpu_allocator::AllocatorDebugSettings;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 
 use crate::error::{Result, RhiError};
+use crate::pipeline_cache::PipelineCache;
 use crate::vendor::{VendorProbeInput, VendorProfile, detect_rebar};
 
 /// Vulkan 1.4 API version constant (`vk::make_api_version(0, 1, 4, 0)`).
@@ -128,7 +129,9 @@ pub struct RhiDevice {
     pub acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
     pub ray_tracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub cooperative_matrix: Option<ash::khr::cooperative_matrix::Instance>,
+    pub pipeline_cache: vk::PipelineCache,
 
+    pipeline_cache_owner: PipelineCache,
     allocator: ManuallyDrop<Allocator>,
     debug_utils: Option<ash::ext::debug_utils::Instance>,
     debug_messenger: vk::DebugUtilsMessengerEXT,
@@ -262,6 +265,10 @@ impl RhiDevice {
             None
         };
 
+        let pipeline_cache_path = PipelineCache::default_path(&capabilities);
+        let pipeline_cache_owner = PipelineCache::load_or_create(&device, pipeline_cache_path)?;
+        let pipeline_cache = pipeline_cache_owner.handle();
+
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
@@ -284,6 +291,8 @@ impl RhiDevice {
             acceleration_structure,
             ray_tracing_pipeline,
             cooperative_matrix,
+            pipeline_cache,
+            pipeline_cache_owner,
             allocator: ManuallyDrop::new(allocator),
             debug_utils,
             debug_messenger,
@@ -308,6 +317,11 @@ impl RhiDevice {
     #[inline]
     pub fn validation_warnings(&self) -> u32 {
         self.validation_counters.warnings.load(Ordering::Relaxed)
+    }
+
+    /// Persist the active `VkPipelineCache` to disk immediately.
+    pub fn save_pipeline_cache(&self) -> Result<()> {
+        self.pipeline_cache_owner.save(&self.device)
     }
 
     /// Wait for the logical device to become idle.
@@ -407,6 +421,7 @@ impl Drop for RhiDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.pipeline_cache_owner.destroy(&self.device);
             ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
             if let Some(du) = &self.debug_utils

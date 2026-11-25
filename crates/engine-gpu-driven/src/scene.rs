@@ -1,7 +1,7 @@
 use ash::vk;
 use bytemuck::cast_slice;
 use engine_rhi::gpu_allocator::MemoryLocation;
-use engine_rhi::{GpuBuffer, Result, RhiDevice, sync};
+use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, Result, RhiDevice, sync};
 
 use crate::types::{
     DrawIndexedIndirectCommand, FrameUniforms, GpuInstanceData, GpuMeshDrawInfo, GpuVertex,
@@ -14,9 +14,9 @@ pub struct GpuScene {
     pub instance_buffer: GpuBuffer,
     pub mesh_buffer: GpuBuffer,
     pub indirect_draw_buffer: GpuBuffer,
-    pub draw_count_buffer: GpuBuffer,
+    pub draw_count_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub draw_instance_ids_buffer: GpuBuffer,
-    pub frame_uniforms_buffer: GpuBuffer,
+    pub frame_uniforms_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub instance_count: u32,
 }
 
@@ -85,16 +85,22 @@ impl GpuScene {
             MemoryLocation::GpuOnly,
         )?;
 
-        let draw_count_buffer = GpuBuffer::new(
-            &device,
-            rhi.allocator_mut(),
-            "scene-draw-count",
-            std::mem::size_of::<u32>() as vk::DeviceSize,
-            vk::BufferUsageFlags::INDIRECT_BUFFER
-                | vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuToCpu,
-        )?;
+        let mut draw_count_vec = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for slot in 0..FRAMES_IN_FLIGHT {
+            draw_count_vec.push(GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                &format!("scene-draw-count-{slot}"),
+                std::mem::size_of::<u32>() as vk::DeviceSize,
+                vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuToCpu,
+            )?);
+        }
+        let draw_count_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] = draw_count_vec
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
 
         let draw_ids_size = (instance_count as usize * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let draw_instance_ids_buffer = GpuBuffer::new(
@@ -106,14 +112,20 @@ impl GpuScene {
             MemoryLocation::GpuOnly,
         )?;
 
-        let frame_uniforms_buffer = GpuBuffer::new(
-            &device,
-            rhi.allocator_mut(),
-            "scene-frame-uniforms",
-            std::mem::size_of::<FrameUniforms>() as vk::DeviceSize,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            MemoryLocation::CpuToGpu,
-        )?;
+        let mut frame_uniforms_vec = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for slot in 0..FRAMES_IN_FLIGHT {
+            frame_uniforms_vec.push(GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                &format!("scene-frame-uniforms-{slot}"),
+                std::mem::size_of::<FrameUniforms>() as vk::DeviceSize,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?);
+        }
+        let frame_uniforms_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] = frame_uniforms_vec
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
 
         Ok(Self {
             vertex_buffer,
@@ -121,24 +133,43 @@ impl GpuScene {
             instance_buffer,
             mesh_buffer,
             indirect_draw_buffer,
-            draw_count_buffer,
+            draw_count_buffers,
             draw_instance_ids_buffer,
-            frame_uniforms_buffer,
+            frame_uniforms_buffers,
             instance_count,
         })
     }
 
-    /// Write `FrameUniforms` into the host-visible BDA uniform buffer.
-    pub fn update_frame_uniforms(&mut self, uniforms: &FrameUniforms) -> Result<()> {
+    /// Write `FrameUniforms` into the ring-buffered host-visible BDA uniform buffer for `frame_slot`.
+    pub fn update_frame_uniforms(
+        &mut self,
+        frame_slot: usize,
+        uniforms: &FrameUniforms,
+    ) -> Result<()> {
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
         let bytes = bytemuck::bytes_of(uniforms);
-        let mapped = self.frame_uniforms_buffer.mapped_slice_mut()?;
+        let mapped = self.frame_uniforms_buffers[slot].mapped_slice_mut()?;
         mapped[..bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 
-    /// Read back the culled draw count written by `cull.comp` (call after GPU execution completes).
-    pub fn read_draw_count(&mut self) -> Result<u32> {
-        let mapped = self.draw_count_buffer.mapped_slice_mut()?;
+    /// Return the BDA address of `frame_uniforms_buffers` for `frame_slot`.
+    #[inline]
+    pub fn frame_uniforms_address(&self, frame_slot: usize) -> u64 {
+        self.frame_uniforms_buffers[frame_slot % FRAMES_IN_FLIGHT].device_address
+    }
+
+    /// Return the `draw_count` buffer for `frame_slot`.
+    #[inline]
+    pub fn draw_count_buffer(&self, frame_slot: usize) -> &GpuBuffer {
+        &self.draw_count_buffers[frame_slot % FRAMES_IN_FLIGHT]
+    }
+
+    /// Read back the culled draw count written by `cull.comp` for `frame_slot`
+    /// (call after the fence for `frame_slot` has completed).
+    pub fn read_draw_count(&mut self, frame_slot: usize) -> Result<u32> {
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
+        let mapped = self.draw_count_buffers[slot].mapped_slice_mut()?;
         Ok(*bytemuck::from_bytes::<u32>(&mapped[..4]))
     }
 
@@ -151,9 +182,13 @@ impl GpuScene {
         self.instance_buffer.destroy(&device, alloc)?;
         self.mesh_buffer.destroy(&device, alloc)?;
         self.indirect_draw_buffer.destroy(&device, alloc)?;
-        self.draw_count_buffer.destroy(&device, alloc)?;
+        for buf in self.draw_count_buffers {
+            buf.destroy(&device, alloc)?;
+        }
         self.draw_instance_ids_buffer.destroy(&device, alloc)?;
-        self.frame_uniforms_buffer.destroy(&device, alloc)?;
+        for buf in self.frame_uniforms_buffers {
+            buf.destroy(&device, alloc)?;
+        }
         Ok(())
     }
 }

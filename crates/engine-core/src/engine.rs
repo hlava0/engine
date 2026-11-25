@@ -1,16 +1,18 @@
-//! Main GPU-driven Vulkan 1.4 + RT + NRD + CoopML engine loop.
+//! Main GPU-driven Vulkan 1.4 + RT + NRD + CoopML engine loop with 2-frames-in-flight pipelining.
 
 use std::time::Instant;
 
 use engine_compute_ml::CoopMlPipeline;
-use engine_gpu_driven::{GpuDrivenPipeline, GpuScene};
+use engine_gpu_driven::{GpuDrivenPipeline, GpuInstanceData, GpuScene};
 use engine_rhi::ash::vk;
 use engine_rhi::gpu_allocator::MemoryLocation;
 use engine_rhi::{
-    BindlessConfig, BindlessTable, CoopMatrixTile, GpuBuffer, GpuImage, RhiConfig, RhiDevice,
-    VendorProfile, sync,
+    BindlessConfig, BindlessTable, CoopMatrixTile, FRAMES_IN_FLIGHT, GpuBuffer, GpuImage,
+    RhiConfig, RhiDevice, VendorProfile, sync,
 };
-use engine_rt_nrd::{AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RtGiPass, RtParams};
+use engine_rt_nrd::{
+    AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RtGiPass, RtParams,
+};
 
 use crate::EngineError;
 use crate::profiler::{GpuProfiler, PassTiming};
@@ -19,12 +21,24 @@ use crate::scene::SceneWorld;
 const DENOISING_RANGE: f32 = 1000.0;
 
 /// Per-frame CPU & GPU execution statistics.
+///
+/// With 2-frames-in-flight async pipelining, `draw_count` and `gpu_timings` reflect the
+/// most recently completed GPU frame for this slot (`frame_index - FRAMES_IN_FLIGHT`),
+/// avoiding any post-submit CPU stall.
 #[derive(Debug, Clone)]
 pub struct FrameStats {
     pub frame_index: u32,
     pub cpu_record_us: f64,
     pub draw_count: u32,
     pub gpu_timings: Vec<PassTiming>,
+}
+
+struct FrameSlot {
+    command_pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    profiler: GpuProfiler,
+    submitted: bool,
 }
 
 /// Top-level headless/render engine owning all Vulkan 1.4 subsystems.
@@ -39,9 +53,8 @@ pub struct Engine {
     compose: Option<NrdComposePass>,
     coop_ml: Option<CoopMlPipeline>,
     output_image: Option<GpuImage>,
-    profiler: Option<GpuProfiler>,
-    command_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
+    frames: Vec<FrameSlot>,
+    gpu_instances_scratch: Vec<GpuInstanceData>,
     pub world: SceneWorld,
     pub width: u32,
     pub height: u32,
@@ -67,33 +80,56 @@ impl Engine {
         let gbuffer_pipe = GpuDrivenPipeline::new(&mut rhi, &bindless, width, height)?;
 
         let (vertices, _, meshes) = world.flatten_geometry();
-        let gpu_instances = world.gpu_instances();
+        let gpu_instances_scratch = world.gpu_instances();
         let gpu_scene = world.build_gpu_scene(&mut rhi)?;
 
-        let command_pool = rhi.create_command_pool(
-            rhi.queue_families.graphics,
-            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-        )?;
-        let cmd = rhi.allocate_command_buffer(command_pool)?;
+        let mut frames = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            let command_pool = rhi.create_command_pool(
+                rhi.queue_families.graphics,
+                vk::CommandPoolCreateFlags::TRANSIENT,
+            )?;
+            let cmd = rhi.allocate_command_buffer(command_pool)?;
+            let fence = unsafe {
+                rhi.device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )?
+            };
+            let profiler = GpuProfiler::new(&rhi, 16)?;
+            frames.push(FrameSlot {
+                command_pool,
+                cmd,
+                fence,
+                profiler,
+                submitted: false,
+            });
+        }
 
-        // Build initial BLAS + TLAS
+        // Build initial BLAS + TLAS using slot 0's command buffer before the async loop starts
+        let init_cmd = frames[0].cmd;
+        let init_pool = frames[0].command_pool;
         unsafe {
             rhi.device.begin_command_buffer(
-                cmd,
+                init_cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
         }
         let accel = AccelStructureManager::build_initial(
             &mut rhi,
-            cmd,
+            init_cmd,
             &gpu_scene,
             &meshes,
-            &gpu_instances,
+            &gpu_instances_scratch,
             vertices.len() as u32,
         )?;
-        unsafe { rhi.device.end_command_buffer(cmd)? };
-        rhi.submit_and_wait(rhi.graphics_queue, cmd)?;
+        unsafe { rhi.device.end_command_buffer(init_cmd)? };
+        rhi.submit_and_wait(rhi.graphics_queue, init_cmd)?;
+        unsafe {
+            rhi.device
+                .reset_command_pool(init_pool, vk::CommandPoolResetFlags::empty())?;
+        }
 
         let materials = world.gpu_materials();
         let lights = world.gpu_lights();
@@ -119,8 +155,6 @@ impl Engine {
             "engine_final_output",
         )?;
 
-        let profiler = GpuProfiler::new(&rhi, 16)?;
-
         Ok(Self {
             rhi,
             bindless: Some(bindless),
@@ -132,15 +166,20 @@ impl Engine {
             compose: Some(compose),
             coop_ml: Some(coop_ml),
             output_image: Some(output_image),
-            profiler: Some(profiler),
-            command_pool,
-            cmd,
+            frames,
+            gpu_instances_scratch,
             world,
             width,
             height,
             frame_index: 0,
             has_hiz_history: false,
         })
+    }
+
+    /// Wait for all in-flight GPU work to finish.
+    pub fn wait_idle(&self) -> Result<(), EngineError> {
+        self.rhi.wait_idle()?;
+        Ok(())
     }
 
     /// Returns `true` if `CoopMlPipeline` is using hardware `VK_KHR_cooperative_matrix`.
@@ -172,23 +211,51 @@ impl Engine {
         self.rhi.validation_errors()
     }
 
-    /// Execute one full frame (Scene sync -> Accel -> Cull+GBuffer+HiZ -> RT GI -> NRD -> Compose -> CoopML).
+    /// Execute one full pipelined frame (Scene sync -> Accel -> Cull+GBuffer+HiZ -> RT GI -> NRD -> Compose -> CoopML).
+    ///
+    /// Uses 2-frames-in-flight async pipelining: waits only on frame `N - 2`'s fence, reads back
+    /// its completed GPU timestamps & draw count without stalling, records frame `N`, and submits
+    /// asynchronously via `vkQueueSubmit2`.
     pub fn render_frame(&mut self, dt: f32) -> Result<FrameStats, EngineError> {
         let frame_idx = self.frame_index;
+        let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
         let is_first = frame_idx == 0;
 
-        self.world.step(dt);
+        // 1. Wait only on this slot's fence (frame N - FRAMES_IN_FLIGHT) and reset pool
+        let fence = self.frames[slot_idx].fence;
+        let pool = self.frames[slot_idx].command_pool;
+        let cmd = self.frames[slot_idx].cmd;
+        unsafe {
+            self.rhi.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            self.rhi.device.reset_fences(&[fence])?;
+            self.rhi
+                .device
+                .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
+        }
+
+        // 2. Non-blocking readback of completed GPU timestamps & draw count from this slot
         let gpu_scene = self.gpu_scene.as_mut().expect("gpu_scene");
-        let gpu_instances = self.world.gpu_instances();
+        let (draw_count, gpu_timings) = if self.frames[slot_idx].submitted {
+            let timings = self.frames[slot_idx].profiler.readback(&self.rhi.device)?;
+            let draws = gpu_scene.read_draw_count(slot_idx)?;
+            (draws, timings)
+        } else {
+            (0, Vec::new())
+        };
+
+        // 3. Step simulation and fill pre-allocated scratch buffer (zero heap allocation)
+        self.world.step(dt);
+        let any_transform_dirty = self.world.dirty_instances;
+        if any_transform_dirty {
+            self.world
+                .fill_gpu_instances(&mut self.gpu_instances_scratch);
+        }
 
         let record_start = Instant::now();
 
         unsafe {
-            self.rhi
-                .device
-                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
             self.rhi.device.begin_command_buffer(
-                self.cmd,
+                cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
@@ -196,10 +263,13 @@ impl Engine {
 
         let uniforms = self.world.sync_to_gpu(
             &self.rhi.device,
-            self.cmd,
+            cmd,
             gpu_scene,
+            &self.gpu_instances_scratch,
             self.width,
             self.height,
+            slot_idx,
+            is_first,
         )?;
 
         let rt_params = RtParams {
@@ -223,38 +293,42 @@ impl Engine {
             _pad: 0,
         };
 
-        let profiler = self.profiler.as_mut().expect("profiler");
-        profiler.reset(&self.rhi.device, self.cmd);
+        let profiler = &mut self.frames[slot_idx].profiler;
+        profiler.reset(&self.rhi.device, cmd);
 
-        // 1. Accel (TLAS refit/rebuild for animated instances)
-        let p_accel = profiler.begin_pass(&self.rhi.device, self.cmd, "Accel");
+        // 1. Accel (TLAS refit/rebuild for animated instances; skips cleanly on static frames)
+        let p_accel = profiler.begin_pass(&self.rhi.device, cmd, "Accel");
         if !is_first {
-            self.accel
-                .as_mut()
-                .expect("accel")
-                .update_tlas(&self.rhi, self.cmd, &gpu_instances)?;
+            self.accel.as_mut().expect("accel").update_tlas(
+                &self.rhi,
+                cmd,
+                &self.gpu_instances_scratch,
+                slot_idx,
+                any_transform_dirty,
+            )?;
         }
-        profiler.end_pass(&self.rhi.device, self.cmd, p_accel);
+        profiler.end_pass(&self.rhi.device, cmd, p_accel);
 
         // 2. GPU-driven Cull + GBuffer + Hi-Z
         let bindless = self.bindless.as_ref().expect("bindless");
         let gbuffer_pipe = self.gbuffer_pipe.as_mut().expect("gbuffer_pipe");
-        let p_gbuf = profiler.begin_pass(&self.rhi.device, self.cmd, "Cull+GBuffer+HiZ");
+        let p_gbuf = profiler.begin_pass(&self.rhi.device, cmd, "Cull+GBuffer+HiZ");
         gbuffer_pipe.record_frame(
             &self.rhi,
             bindless,
-            self.cmd,
+            cmd,
             gpu_scene,
             &uniforms,
             self.has_hiz_history,
+            slot_idx,
         )?;
-        profiler.end_pass(&self.rhi.device, self.cmd, p_gbuf);
+        profiler.end_pass(&self.rhi.device, cmd, p_gbuf);
 
         // 3. Hardware Ray Traced GI + Reflections
         let rt_pass = self.rt_pass.as_mut().expect("rt_pass");
-        let p_rt = profiler.begin_pass(&self.rhi.device, self.cmd, "RayTraceGI");
-        rt_pass.record(&self.rhi.device, self.cmd, &gbuffer_pipe.targets, &rt_params)?;
-        profiler.end_pass(&self.rhi.device, self.cmd, p_rt);
+        let p_rt = profiler.begin_pass(&self.rhi.device, cmd, "RayTraceGI");
+        rt_pass.record(&self.rhi.device, cmd, &gbuffer_pipe.targets, &rt_params, slot_idx)?;
+        profiler.end_pass(&self.rhi.device, cmd, p_rt);
 
         // 4. NVIDIA NRD Denoiser
         let nrd = self.nrd.as_mut().expect("nrd");
@@ -267,10 +341,10 @@ impl Engine {
             diff_confidence: &rt_pass.nrd_diff_confidence,
             spec_confidence: &rt_pass.nrd_spec_confidence,
         };
-        let p_nrd = profiler.begin_pass(&self.rhi.device, self.cmd, "NRD");
+        let p_nrd = profiler.begin_pass(&self.rhi.device, cmd, "NRD");
         nrd.record(
             &self.rhi.device,
-            self.cmd,
+            cmd,
             &nrd_inputs,
             self.world.camera.proj,
             self.world.camera.prev_proj,
@@ -281,37 +355,44 @@ impl Engine {
             DENOISING_RANGE,
             (dt * 1000.0).max(0.1),
             is_first,
+            slot_idx,
         )?;
-        profiler.end_pass(&self.rhi.device, self.cmd, p_nrd);
+        profiler.end_pass(&self.rhi.device, cmd, p_nrd);
 
         // 5. NRD Remodulation & Sky Composition
         let compose = self.compose.as_mut().expect("compose");
-        let p_comp = profiler.begin_pass(&self.rhi.device, self.cmd, "Compose");
-        compose.record(&self.rhi.device, self.cmd, rt_pass);
-        profiler.end_pass(&self.rhi.device, self.cmd, p_comp);
+        let p_comp = profiler.begin_pass(&self.rhi.device, cmd, "Compose");
+        compose.record(&self.rhi.device, cmd, rt_pass, slot_idx);
+        profiler.end_pass(&self.rhi.device, cmd, p_comp);
 
         // 6. Cooperative Matrix ML Post-Processing & ACES Tone-Mapping
-        let coop_ml = self.coop_ml.as_ref().expect("coop_ml");
+        let coop_ml = self.coop_ml.as_mut().expect("coop_ml");
         let out_img = self.output_image.as_ref().expect("output_image");
-        let p_ml = profiler.begin_pass(&self.rhi.device, self.cmd, "CoopML");
-        coop_ml.dispatch(
+        let p_ml = profiler.begin_pass(&self.rhi.device, cmd, "CoopML");
+        coop_ml.dispatch_slot(
             &self.rhi.device,
-            self.cmd,
+            cmd,
             &compose.out_hdr,
             out_img,
             self.width,
             self.height,
+            slot_idx,
         );
-        profiler.end_pass(&self.rhi.device, self.cmd, p_ml);
+        profiler.end_pass(&self.rhi.device, cmd, p_ml);
 
-        unsafe { self.rhi.device.end_command_buffer(self.cmd)? };
+        unsafe { self.rhi.device.end_command_buffer(cmd)? };
         let cpu_record_us = record_start.elapsed().as_secs_f64() * 1_000_000.0;
 
-        self.rhi.submit_and_wait(self.rhi.graphics_queue, self.cmd)?;
+        // 4. Submit asynchronously via vkQueueSubmit2 signaling this slot's fence
+        let cmd_submit = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_submit)];
+        unsafe {
+            self.rhi
+                .device
+                .queue_submit2(self.rhi.graphics_queue, &submit_info, fence)?;
+        }
 
-        let draw_count = gpu_scene.read_draw_count()?;
-        let gpu_timings = profiler.readback(&self.rhi.device)?;
-
+        self.frames[slot_idx].submitted = true;
         self.frame_index += 1;
         self.has_hiz_history = true;
 
@@ -324,7 +405,11 @@ impl Engine {
     }
 
     /// Read back the final post-processed `output_image` as `[r, g, b, a]` `f32` pixels.
+    ///
+    /// Automatically drains all in-flight GPU work via `wait_idle()` before copying.
     pub fn readback_output_rgba(&mut self) -> Result<Vec<[f32; 4]>, EngineError> {
+        self.wait_idle()?;
+
         let pixel_count = (self.width * self.height) as usize;
         let byte_size = (pixel_count * 8) as vk::DeviceSize;
         let dev = self.rhi.device.clone();
@@ -339,10 +424,12 @@ impl Engine {
         )?;
 
         let out_img = self.output_image.as_ref().expect("output_image");
+        let pool = self.frames[0].command_pool;
+        let cmd = self.frames[0].cmd;
         unsafe {
-            dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
+            dev.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
             dev.begin_command_buffer(
-                self.cmd,
+                cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
@@ -356,7 +443,7 @@ impl Engine {
                 vk::AccessFlags2::TRANSFER_READ,
                 out_img.subresource_range(),
             )];
-            sync::cmd_pipeline_barrier2(&dev, self.cmd, &[], &[], &to_src);
+            sync::cmd_pipeline_barrier2(&dev, cmd, &[], &[], &to_src);
 
             let region = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers {
@@ -371,7 +458,7 @@ impl Engine {
                     depth: 1,
                 });
             dev.cmd_copy_image_to_buffer(
-                self.cmd,
+                cmd,
                 out_img.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 staging.buffer,
@@ -388,11 +475,11 @@ impl Engine {
                 vk::AccessFlags2::NONE,
                 out_img.subresource_range(),
             )];
-            sync::cmd_pipeline_barrier2(&dev, self.cmd, &[], &[], &to_gen);
-            dev.end_command_buffer(self.cmd)?;
+            sync::cmd_pipeline_barrier2(&dev, cmd, &[], &[], &to_gen);
+            dev.end_command_buffer(cmd)?;
         }
 
-        self.rhi.submit_and_wait(self.rhi.graphics_queue, self.cmd)?;
+        self.rhi.submit_and_wait(self.rhi.graphics_queue, cmd)?;
 
         let bytes = staging
             .allocation
@@ -418,11 +505,15 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.rhi.wait_idle();
+        let _ = self.wait_idle();
         let dev = self.rhi.device.clone();
 
-        if let Some(p) = self.profiler.take() {
-            p.destroy(&dev);
+        for slot in self.frames.drain(..) {
+            slot.profiler.destroy(&dev);
+            unsafe {
+                dev.destroy_fence(slot.fence, None);
+                dev.destroy_command_pool(slot.command_pool, None);
+            }
         }
         if let Some(img) = self.output_image.take() {
             let _ = img.destroy(&dev, self.rhi.allocator_mut());
@@ -450,9 +541,6 @@ impl Drop for Engine {
         }
         if let Some(b) = self.bindless.take() {
             b.destroy(&dev);
-        }
-        unsafe {
-            dev.destroy_command_pool(self.command_pool, None);
         }
     }
 }

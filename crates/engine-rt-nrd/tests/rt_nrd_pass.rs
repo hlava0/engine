@@ -299,8 +299,9 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
             screen_size: [WIDTH, HEIGHT],
             hiz_size: [WIDTH, HEIGHT],
         };
+        let slot = frame as usize;
         scene
-            .update_frame_uniforms(&uniforms)
+            .update_frame_uniforms(slot, &uniforms)
             .expect("update_frame_uniforms");
 
         let rt_params = RtParams {
@@ -327,16 +328,16 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
 
         if frame > 0 {
             accel
-                .update_tlas(&rhi, cmd, &instances)
+                .update_tlas(&rhi, cmd, &instances, slot, true)
                 .expect("update_tlas");
         }
 
         gbuffer_pipe
-            .record_frame(&rhi, &bindless, cmd, &mut scene, &uniforms, false)
+            .record_frame(&rhi, &bindless, cmd, &mut scene, &uniforms, false, slot)
             .expect("gbuffer record_frame");
 
         rt_pass
-            .record(&rhi.device, cmd, &gbuffer_pipe.targets, &rt_params)
+            .record(&rhi.device, cmd, &gbuffer_pipe.targets, &rt_params, slot)
             .expect("rt_pass record");
 
         let nrd_inputs = NrdInputs {
@@ -361,10 +362,11 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
             DENOISING_RANGE,
             16.67,
             frame == 0,
+            slot,
         )
         .expect("nrd record");
 
-        compose.record(&rhi.device, cmd, &rt_pass);
+        compose.record(&rhi.device, cmd, &rt_pass, slot);
 
         if frame == 1 {
             let copy_barrier = [sync::image_barrier(
@@ -412,7 +414,7 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
     let words: &[u16] = bytemuck::cast_slice(bytes);
     let mut non_zero_pixels = 0usize;
     let mut max_lum = 0.0f32;
-    for px in words.chunks_exact(4) {
+    for px in words.as_chunks::<4>().0 {
         let r = f16_to_f32(px[0]);
         let g = f16_to_f32(px[1]);
         let b = f16_to_f32(px[2]);

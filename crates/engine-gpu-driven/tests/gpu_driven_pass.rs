@@ -175,7 +175,15 @@ fn headless_gpu_driven_frustum_and_hiz_cull() {
         }
 
         pipeline
-            .record_frame(&rhi, &bindless, cmd, &mut scene, &uniforms, enable_hiz)
+            .record_frame(
+                &rhi,
+                &bindless,
+                cmd,
+                &mut scene,
+                &uniforms,
+                enable_hiz,
+                frame_idx as usize,
+            )
             .expect("record_frame");
 
         unsafe {
@@ -186,7 +194,9 @@ fn headless_gpu_driven_frustum_and_hiz_cull() {
         rhi.submit_and_wait(rhi.graphics_queue, cmd)
             .expect("submit_and_wait");
 
-        scene.read_draw_count().expect("read_draw_count")
+        scene
+            .read_draw_count(frame_idx as usize)
+            .expect("read_draw_count")
     };
 
     // Frame 0: frustum cull only -> instances 0, 1, 2 pass (instance 3 culled)

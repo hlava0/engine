@@ -2,7 +2,7 @@ use ash::vk;
 use bytemuck::cast_slice;
 use engine_gpu_driven::GBufferTargets;
 use engine_rhi::gpu_allocator::MemoryLocation;
-use engine_rhi::{GpuBuffer, GpuImage, RhiDevice, load_shader_words, sync};
+use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, GpuImage, RhiDevice, load_shader_words, sync};
 
 use crate::accel::AccelStructureManager;
 use crate::error::Result;
@@ -18,7 +18,7 @@ pub struct RtGiPass {
     pub nrd_diff_confidence: GpuImage,
     pub nrd_spec_confidence: GpuImage,
 
-    pub params_buffer: GpuBuffer,
+    pub params_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub materials_buffer: GpuBuffer,
     pub lights_buffer: GpuBuffer,
 
@@ -108,14 +108,19 @@ impl RtGiPass {
             "nrd-in-spec-confidence",
         )?;
 
-        let params_buffer = GpuBuffer::new(
-            &device,
-            rhi.allocator_mut(),
-            "rt-params",
-            std::mem::size_of::<RtParams>() as vk::DeviceSize,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            MemoryLocation::CpuToGpu,
-        )?;
+        let mut params_vec = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for slot in 0..FRAMES_IN_FLIGHT {
+            params_vec.push(GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                &format!("rt-params-{slot}"),
+                std::mem::size_of::<RtParams>() as vk::DeviceSize,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?);
+        }
+        let params_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] =
+            params_vec.try_into().unwrap_or_else(|_| unreachable!());
 
         let default_mat = [GpuRtMaterial::default()];
         let mat_slice = if materials.is_empty() { &default_mat } else { materials };
@@ -268,7 +273,7 @@ impl RtGiPass {
             .stage(stage)
             .layout(pipeline_layout)];
         let pipeline = unsafe {
-            let res = device.create_compute_pipelines(vk::PipelineCache::null(), &pipe_info, None);
+            let res = device.create_compute_pipelines(rhi.pipeline_cache, &pipe_info, None);
             device.destroy_shader_module(module, None);
             res.map_err(|(_, e)| e)?[0]
         };
@@ -281,7 +286,7 @@ impl RtGiPass {
             nrd_view_z,
             nrd_diff_confidence,
             nrd_spec_confidence,
-            params_buffer,
+            params_buffers,
             materials_buffer,
             lights_buffer,
             sampler,
@@ -406,15 +411,23 @@ impl RtGiPass {
         }
     }
 
-    /// Update `RtParams` and record G-buffer transitions + `rt_gi.comp` dispatch.
+    /// Return the BDA address of `params_buffers` for `frame_slot`.
+    #[inline]
+    pub fn params_device_address(&self, frame_slot: usize) -> u64 {
+        self.params_buffers[frame_slot % FRAMES_IN_FLIGHT].device_address
+    }
+
+    /// Update `RtParams` for `frame_slot` and record G-buffer transitions + `rt_gi.comp` dispatch.
     pub fn record(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         gbuffer: &GBufferTargets,
         params: &RtParams,
+        frame_slot: usize,
     ) -> Result<()> {
-        self.params_buffer
+        let slot = frame_slot % FRAMES_IN_FLIGHT;
+        self.params_buffers[slot]
             .mapped_slice_mut()?
             .copy_from_slice(bytemuck::bytes_of(params));
 
@@ -536,7 +549,7 @@ impl RtGiPass {
         ];
 
         let pc = RtGiPushConstants {
-            params_ptr: self.params_buffer.device_address,
+            params_ptr: self.params_buffers[slot].device_address,
             materials_ptr: self.materials_buffer.device_address,
             lights_ptr: self.lights_buffer.device_address,
         };
@@ -648,7 +661,9 @@ impl RtGiPass {
             device.destroy_sampler(self.sampler, None);
         }
         let alloc = rhi.allocator_mut();
-        self.params_buffer.destroy(&device, alloc)?;
+        for buf in self.params_buffers {
+            buf.destroy(&device, alloc)?;
+        }
         self.materials_buffer.destroy(&device, alloc)?;
         self.lights_buffer.destroy(&device, alloc)?;
         self.nrd_diff_rad_hitdist.destroy(&device, alloc)?;
