@@ -116,12 +116,36 @@ impl RigidBody {
     }
 }
 
-/// Collision shape component for deterministic 3D rigid-body physics.
+/// Collision shape component for `rapier3d` 3D rigid-body physics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Collider {
     Sphere { radius: f32 },
     Box { half_extents: [f32; 3] },
+    Capsule { half_height: f32, radius: f32 },
     GroundPlane { y: f32 },
+}
+
+/// Optional triangle-mesh collider component for static/kinematic level geometry in `rapier3d`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriMeshCollider {
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<[u32; 3]>,
+}
+
+/// Joint constraint connecting an entity's [`RigidBody`] to another entity in `rapier3d`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JointKind {
+    Fixed,
+    Spherical,
+    Revolute { axis: [f32; 3] },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsJoint {
+    pub other: Entity,
+    pub kind: JointKind,
+    pub anchor_self: [f32; 3],
+    pub anchor_other: [f32; 3],
 }
 
 /// Point light component attached to an entity's [`Transform`].

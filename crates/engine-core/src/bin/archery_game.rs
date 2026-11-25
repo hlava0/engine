@@ -11,8 +11,8 @@ use engine_core::{
     create_cube_mesh, create_plane_mesh, create_sphere_mesh,
 };
 use engine_gameplay::{
-    AudioEngine, Collider, GameWorld, MeshRenderer, Name, PhysicsConfig, RigidBody, Transform,
-    step_physics,
+    AudioEngine, Collider, GameWorld, MeshRenderer, Name, PhysicsConfig, PhysicsWorld, RigidBody,
+    Transform,
 };
 use engine_gpu_driven::types::mat4_translation_scale;
 use engine_rhi::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -400,6 +400,7 @@ struct ArcheryApp {
     window: Option<Arc<Window>>,
     engine: Option<Engine>,
     game: GameWorld,
+    physics: PhysicsWorld,
     physics_cfg: PhysicsConfig,
     audio: AudioEngine,
     pacer: FramePacer,
@@ -432,6 +433,7 @@ impl ArcheryApp {
             window: None,
             engine: None,
             game: GameWorld::new(),
+            physics: PhysicsWorld::new(),
             physics_cfg: PhysicsConfig::default(),
             audio: AudioEngine::new(),
             pacer: FramePacer::default(),
@@ -611,8 +613,9 @@ impl ArcheryApp {
             }
         }
 
-        // Step ECS rigid-body spheres
-        step_physics(&mut self.game.world, &self.physics_cfg, dt);
+        // Step ECS rigid-body spheres (Rapier3D)
+        self.physics
+            .step(&mut self.game.world, &self.physics_cfg, dt);
 
         // Step arrow projectiles & check collisions
         for arrow in &mut self.arrows {
@@ -649,7 +652,13 @@ impl ArcheryApp {
                         self.hits += 1;
                         self.hit_flash = 1.0;
                         if self.sound_enabled {
-                            self.audio.play_beep(880.0, 70);
+                            self.audio.play_spatial_beep(
+                                880.0,
+                                75,
+                                self.player.position,
+                                self.player.right_xz(),
+                                tgt.pos,
+                            );
                         }
                     }
                     break;
@@ -674,7 +683,13 @@ impl ArcheryApp {
                             rb.velocity[2] += arrow.vel[2] * 0.28;
                             arrow.stuck = true;
                             if self.sound_enabled {
-                                self.audio.play_beep(440.0, 50);
+                                self.audio.play_spatial_beep(
+                                    440.0,
+                                    55,
+                                    self.player.position,
+                                    self.player.right_xz(),
+                                    tf.position,
+                                );
                             }
                             break;
                         }

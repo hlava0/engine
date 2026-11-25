@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 hecs.workspace = true
+rapier3d.workspace = true
 rhai.workspace = true
 rodio.workspace = true
+egui.workspace = true
 thiserror.workspace = true
 log.workspace = true

@@ -1,5 +1,6 @@
 //! Data-oriented scene/ECS, GPU timestamp profiler, and full Vulkan 1.4 engine loop.
 
+pub mod egui_renderer;
 pub mod engine;
 pub mod hud;
 pub mod pacer;

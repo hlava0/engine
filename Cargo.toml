@@ -28,5 +28,8 @@ env_logger = "0.11"
 gltf = "1.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "tga"] }
 hecs = "0.10"
+rapier3d = "0.22"
 rhai = { version = "1.20", default-features = false, features = ["std", "sync"] }
 rodio = { version = "0.20", default-features = false, features = ["wav"] }
+egui = "0.29"
+egui-winit = "0.29"

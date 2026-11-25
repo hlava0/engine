@@ -8,8 +8,8 @@ use std::time::Instant;
 use engine_assets::load_gltf_from_path;
 use engine_core::{Engine, FramePacer, SceneWorld, create_demo_scene};
 use engine_gameplay::{
-    AudioEngine, Collider, GameWorld, MeshRenderer, Name, PhysicsConfig, RigidBody, SceneEditor,
-    ScriptComponent, ScriptEngine, Transform, step_physics,
+    AudioEngine, Collider, GameWorld, MeshRenderer, Name, PhysicsConfig, PhysicsWorld, RigidBody,
+    SceneEditor, ScriptComponent, ScriptEngine, Transform,
 };
 use engine_rhi::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -123,10 +123,13 @@ struct ViewerApp {
     window: Option<Arc<Window>>,
     engine: Option<Engine>,
     game: GameWorld,
+    physics: PhysicsWorld,
     physics_cfg: PhysicsConfig,
     scripts: ScriptEngine,
     audio: AudioEngine,
     editor: SceneEditor,
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
     pacer: FramePacer,
     camera: FreeFlyCamera,
     pressed_keys: HashSet<KeyCode>,
@@ -147,10 +150,13 @@ impl ViewerApp {
             window: None,
             engine: None,
             game: GameWorld::new(),
+            physics: PhysicsWorld::new(),
             physics_cfg: PhysicsConfig::default(),
             scripts: ScriptEngine::new(),
             audio: AudioEngine::new(),
             editor: SceneEditor::new(),
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
             pacer: FramePacer::default(),
             camera: FreeFlyCamera {
                 position: [0.0, 1.8, 5.5],
@@ -316,6 +322,15 @@ impl ApplicationHandler for ViewerApp {
             engine.coop_ml_tile()
         );
 
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        self.egui_state = Some(egui_state);
         self.window = Some(window);
         self.engine = Some(engine);
         self.last_frame = Instant::now();
@@ -328,6 +343,12 @@ impl ApplicationHandler for ViewerApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let (Some(win), Some(egui_state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+            let resp = egui_state.on_window_event(win, &event);
+            if resp.consumed {
+                return;
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -368,6 +389,9 @@ impl ApplicationHandler for ViewerApp {
                             if fresh {
                                 match code {
                                     KeyCode::Escape => event_loop.exit(),
+                                    KeyCode::F1 => {
+                                        self.editor.show_editor_ui = !self.editor.show_editor_ui;
+                                    }
                                     KeyCode::KeyP => {
                                         self.editor.toggle_pause();
                                     }
@@ -415,17 +439,32 @@ impl ApplicationHandler for ViewerApp {
                     let fixed_dt = self.pacer.fixed_dt() as f32;
                     for _ in 0..fixed_steps {
                         self.sim_time += fixed_dt;
-                        step_physics(&mut self.game.world, &self.physics_cfg, fixed_dt);
+                        self.physics
+                            .step(&mut self.game.world, &self.physics_cfg, fixed_dt);
                         self.scripts
                             .step_scripts(&mut self.game.world, fixed_dt, self.sim_time);
                     }
                 }
 
+                let egui_output = if let (Some(win), Some(egui_state)) =
+                    (self.window.as_ref(), self.egui_state.as_mut())
+                {
+                    let raw_input = egui_state.take_egui_input(win);
+                    let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                        self.editor.draw_ui(ctx, &mut self.game.world);
+                    });
+                    egui_state.handle_platform_output(win, full_output.platform_output.clone());
+                    Some(full_output)
+                } else {
+                    None
+                };
+
                 if let Some(engine) = self.engine.as_mut() {
                     self.camera.apply_to_scene(&mut engine.world);
                     engine.world.sync_from_game_world(&self.game);
 
-                    match engine.render_frame_to_swapchain(dt_f32) {
+                    let ui_arg = egui_output.map(|out| (&self.egui_ctx, out));
+                    match engine.render_frame_to_swapchain_with_egui(dt_f32, ui_arg) {
                         Ok((stats, needs_recreate)) => {
                             if !stats.gpu_timings.is_empty() {
                                 self.last_gpu_ms =

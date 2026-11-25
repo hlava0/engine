@@ -1,7 +1,7 @@
 use engine_gameplay::{
-    AudioEngine, AudioSource, Collider, GameWorld, MeshRenderer, Name, PhysicsConfig,
-    PointLightComponent, RigidBody, SceneEditor, ScriptComponent, ScriptEngine, Transform,
-    step_physics,
+    AudioEngine, AudioSource, Collider, GameWorld, JointKind, MeshRenderer, Name, PhysicsConfig,
+    PhysicsJoint, PhysicsWorld, PointLightComponent, RigidBody, SceneEditor, ScriptComponent,
+    ScriptEngine, Transform, TriMeshCollider,
 };
 
 #[test]
@@ -50,21 +50,22 @@ fn physics_gravity_ground_bounce_and_sphere_collision() {
         Collider::Sphere { radius: 0.5 },
     ));
 
+    let mut pw = PhysicsWorld::new();
     let cfg = PhysicsConfig::default();
     let dt = 1.0 / 60.0;
     let mut hit_ground = false;
     let mut bounced_up = false;
 
     for _ in 0..120 {
-        step_physics(&mut game.world, &cfg, dt);
+        pw.step(&mut game.world, &cfg, dt);
         let t = game.world.get::<&Transform>(ball).unwrap();
         let rb = game.world.get::<&RigidBody>(ball).unwrap();
         assert!(
-            t.position[1] >= 0.5 - 1e-4,
+            t.position[1] >= 0.45,
             "Sphere penetrated ground plane: y={}",
             t.position[1]
         );
-        if (t.position[1] - 0.5).abs() < 1e-3 {
+        if t.position[1] <= 0.55 {
             hit_ground = true;
         }
         if hit_ground && rb.velocity[1] > 0.5 {
@@ -76,6 +77,7 @@ fn physics_gravity_ground_bounce_and_sphere_collision() {
     assert!(bounced_up, "Ball did not bounce upward after hitting ground");
 
     // Sphere-vs-sphere head-on elastic collision
+    let mut sphere_pw = PhysicsWorld::new();
     let mut sphere_world = GameWorld::new();
     let mut rb_a = RigidBody::dynamic(1.0, 1.0);
     rb_a.use_gravity = false;
@@ -100,7 +102,7 @@ fn physics_gravity_ground_bounce_and_sphere_collision() {
         linear_damping: 0.0,
     };
     for _ in 0..20 {
-        step_physics(&mut sphere_world.world, &zero_damp, 1.0 / 60.0);
+        sphere_pw.step(&mut sphere_world.world, &zero_damp, 1.0 / 60.0);
     }
     let va = sphere_world.world.get::<&RigidBody>(a).unwrap().velocity[0];
     let vb = sphere_world.world.get::<&RigidBody>(b).unwrap().velocity[0];
@@ -155,4 +157,83 @@ fn scene_editor_selection_and_nudge() {
     editor.select_next(&game.world);
     let s1 = editor.selected_summary(&game.world);
     assert!(s1.contains("Second"), "Expected Second, got {s1}");
+}
+
+#[test]
+fn rapier_box_box_trimesh_joint_and_raycast() {
+    let mut pw = PhysicsWorld::new();
+    let mut game = GameWorld::new();
+    let cfg = PhysicsConfig::default();
+
+    // Static triangle-mesh floor at y = 0
+    game.spawn((
+        Name::new("TriMeshFloor"),
+        TriMeshCollider {
+            vertices: vec![
+                [-10.0, 0.0, -10.0],
+                [10.0, 0.0, -10.0],
+                [10.0, 0.0, 10.0],
+                [-10.0, 0.0, 10.0],
+            ],
+            indices: vec![[0, 1, 2], [0, 2, 3]],
+        },
+    ));
+
+    // Falling box onto trimesh floor
+    let box_a = game.spawn((
+        Name::new("BoxA"),
+        Transform::from_position([0.0, 2.0, 0.0]),
+        RigidBody::dynamic(1.0, 0.2),
+        Collider::Box {
+            half_extents: [0.5, 0.5, 0.5],
+        },
+    ));
+
+    // Second box attached via spherical joint to BoxA
+    let box_b = game.spawn((
+        Name::new("BoxB"),
+        Transform::from_position([1.5, 2.0, 0.0]),
+        RigidBody::dynamic(1.0, 0.2),
+        Collider::Box {
+            half_extents: [0.5, 0.5, 0.5],
+        },
+        PhysicsJoint {
+            other: box_a,
+            kind: JointKind::Spherical,
+            anchor_self: [-0.75, 0.0, 0.0],
+            anchor_other: [0.75, 0.0, 0.0],
+        },
+    ));
+
+    for _ in 0..90 {
+        pw.step(&mut game.world, &cfg, 1.0 / 60.0);
+    }
+
+    let ta = *game.world.get::<&Transform>(box_a).unwrap();
+    let tb = *game.world.get::<&Transform>(box_b).unwrap();
+    assert!(ta.position[1] >= 0.4 && ta.position[1] < 1.2, "BoxA y={}", ta.position[1]);
+    assert!(tb.position[1] >= 0.4 && tb.position[1] < 1.5, "BoxB y={}", tb.position[1]);
+
+    // Raycast downward from above BoxA
+    let hit = pw.raycast([0.0, 5.0, 0.0], [0.0, -1.0, 0.0], 10.0);
+    assert!(hit.is_some(), "Expected raycast to hit BoxA or floor");
+}
+
+#[test]
+fn rhai_velocity_impulse_and_spatial_audio_safe() {
+    let mut game = GameWorld::new();
+    let mut scripts = ScriptEngine::new();
+    let ent = game.spawn((
+        Name::new("Rocket"),
+        Transform::default(),
+        RigidBody::dynamic(1.0, 0.5),
+        ScriptComponent::new("impulse_y = 5.0;"),
+    ));
+    scripts.step_scripts(&mut game.world, 1.0 / 60.0, 0.0);
+    let rb = game.world.get::<&RigidBody>(ent).unwrap();
+    assert!((rb.velocity[1] - 5.0).abs() < 1e-4);
+
+    let audio = AudioEngine::new();
+    audio.play_spatial_beep(440.0, 10, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, -3.0]);
+    audio.play_impact(180.0, 20);
 }

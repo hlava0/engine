@@ -9,10 +9,10 @@ pub mod scripting;
 
 pub use audio::AudioEngine;
 pub use ecs::{
-    AudioSource, Collider, GameWorld, MeshRenderer, Name, PointLightComponent, RigidBody,
-    ScriptComponent, Transform,
+    AudioSource, Collider, GameWorld, JointKind, MeshRenderer, Name, PhysicsJoint,
+    PointLightComponent, RigidBody, ScriptComponent, Transform, TriMeshCollider,
 };
 pub use editor::SceneEditor;
 pub use hecs;
-pub use physics::{PhysicsConfig, step_physics};
+pub use physics::{PhysicsConfig, PhysicsWorld, step_physics};
 pub use scripting::ScriptEngine;

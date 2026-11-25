@@ -18,6 +18,7 @@ use engine_rt_nrd::{
 };
 
 use crate::EngineError;
+use crate::egui_renderer::EguiVulkanRenderer;
 use crate::hud::{HudOverlayPass, HudOverlayState};
 use crate::profiler::{GpuProfiler, PassTiming};
 use crate::scene::SceneWorld;
@@ -78,6 +79,7 @@ pub struct Engine {
     compose: Option<NrdComposePass>,
     coop_ml: Option<CoopMlPipeline>,
     hud_pass: Option<HudOverlayPass>,
+    egui_renderer: Option<EguiVulkanRenderer>,
     output_image: Option<GpuImage>,
     frames: Vec<FrameSlot>,
     gpu_instances_scratch: Vec<GpuInstanceData>,
@@ -227,6 +229,11 @@ impl Engine {
 
         let coop_ml = CoopMlPipeline::new(&mut rhi, false)?;
         let hud_pass = HudOverlayPass::new(&mut rhi)?;
+        let egui_renderer = if let Some(sc) = swapchain.as_ref() {
+            Some(EguiVulkanRenderer::new(&rhi, sc.format)?)
+        } else {
+            None
+        };
 
         let dev = rhi.device.clone();
         let output_image = GpuImage::create_2d(
@@ -253,6 +260,7 @@ impl Engine {
             compose: Some(compose),
             coop_ml: Some(coop_ml),
             hud_pass: Some(hud_pass),
+            egui_renderer,
             output_image: Some(output_image),
             frames,
             gpu_instances_scratch,
@@ -376,6 +384,15 @@ impl Engine {
     /// Returns `Ok((stats, needs_recreate))`, where `needs_recreate` is `true` if the swapchain
     /// reported `SUBOPTIMAL_KHR` or `ERROR_OUT_OF_DATE_KHR` and should be resized via [`Engine::resize_swapchain`].
     pub fn render_frame_to_swapchain(&mut self, dt: f32) -> Result<(FrameStats, bool), EngineError> {
+        self.render_frame_to_swapchain_with_egui(dt, None)
+    }
+
+    /// Execute one full pipelined frame, composite an `egui` visual editor/UI overlay, and present.
+    pub fn render_frame_to_swapchain_with_egui(
+        &mut self,
+        dt: f32,
+        egui_ui: Option<(&egui::Context, egui::FullOutput)>,
+    ) -> Result<(FrameStats, bool), EngineError> {
         let frame_idx = self.frame_index;
         let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
         let is_first = frame_idx == 0;
@@ -410,6 +427,7 @@ impl Engine {
         };
 
         let swapchain_image = swapchain.images[image_index as usize];
+        let swapchain_view = swapchain.image_views[image_index as usize];
         let swapchain_extent = swapchain.extent;
         let image_available_sem = swapchain.image_available_semaphore(slot_idx);
         let render_finished_sem = swapchain.render_finished_semaphore(image_index);
@@ -421,6 +439,24 @@ impl Engine {
                 .device
                 .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
         }
+
+        // Upload any egui font/texture deltas before recording the main frame command buffer
+        let egui_primitives = if let Some((ctx, full_output)) = egui_ui {
+            if let Some(egui_vk) = self.egui_renderer.as_mut() {
+                egui_vk.update_textures(&mut self.rhi, pool, &full_output.textures_delta)?;
+                unsafe {
+                    self.rhi
+                        .device
+                        .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
+                }
+            }
+            Some((
+                full_output.pixels_per_point,
+                ctx.tessellate(full_output.shapes, full_output.pixels_per_point),
+            ))
+        } else {
+            None
+        };
 
         let (draw_count, gpu_timings, record_start) =
             self.record_render_passes(cmd, dt, frame_idx, slot_idx, is_first)?;
@@ -500,31 +536,94 @@ impl Engine {
             self.rhi.device.cmd_blit_image2(cmd, &blit_info);
         }
 
-        let post_blit_barriers = [
-            sync::image_barrier(
+        let has_egui = egui_primitives
+            .as_ref()
+            .is_some_and(|(_, prims)| !prims.is_empty())
+            && self.egui_renderer.is_some();
+
+        if let Some((ppp, prims)) = egui_primitives
+            && has_egui
+        {
+            let to_color_att = [sync::image_barrier(
                 swapchain_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 color_subresource,
-            ),
-            sync::image_barrier(
-                out_img.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::ImageLayout::GENERAL,
-                vk::PipelineStageFlags2::TRANSFER,
-                vk::AccessFlags2::TRANSFER_READ,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                out_img.subresource_range(),
-            ),
-        ];
-        unsafe {
-            sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &post_blit_barriers);
-            self.rhi.device.end_command_buffer(cmd)?;
+            )];
+            unsafe {
+                sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &to_color_att);
+            }
+            if let Some(mut egui_vk) = self.egui_renderer.take() {
+                let res = egui_vk.record(
+                    &mut self.rhi,
+                    cmd,
+                    swapchain_view,
+                    swapchain_extent,
+                    ppp,
+                    &prims,
+                    slot_idx,
+                );
+                self.egui_renderer = Some(egui_vk);
+                res?;
+            }
+            let post_egui = [
+                sync::image_barrier(
+                    swapchain_image,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                    vk::AccessFlags2::NONE,
+                    color_subresource,
+                ),
+                sync::image_barrier(
+                    out_img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    out_img.subresource_range(),
+                ),
+            ];
+            unsafe {
+                sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &post_egui);
+                self.rhi.device.end_command_buffer(cmd)?;
+            }
+        } else {
+            let post_blit_barriers = [
+                sync::image_barrier(
+                    swapchain_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                    vk::AccessFlags2::NONE,
+                    color_subresource,
+                ),
+                sync::image_barrier(
+                    out_img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    out_img.subresource_range(),
+                ),
+            ];
+            unsafe {
+                sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &post_blit_barriers);
+                self.rhi.device.end_command_buffer(cmd)?;
+            }
         }
         let cpu_record_us = record_start.elapsed().as_secs_f64() * 1_000_000.0;
 
@@ -843,6 +942,9 @@ impl Drop for Engine {
         }
         if let Some(img) = self.output_image.take() {
             let _ = img.destroy(&dev, self.rhi.allocator_mut());
+        }
+        if let Some(egui_vk) = self.egui_renderer.take() {
+            let _ = egui_vk.destroy(&mut self.rhi);
         }
         if let Some(hud) = self.hud_pass.take() {
             let _ = hud.destroy(&mut self.rhi);
