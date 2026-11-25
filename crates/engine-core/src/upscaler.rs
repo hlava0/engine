@@ -7,6 +7,73 @@ use engine_rhi::{FRAMES_IN_FLIGHT, GpuImage, RhiDevice, load_shader_words, sync}
 
 use crate::EngineError;
 
+#[cfg(has_fsr31)]
+mod fsr31_ffi {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct EngineFsr31Handle {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct EngineFsr31CreateInfo {
+        pub vk_device: u64,
+        pub vk_physical_device: u64,
+        pub vk_get_device_proc_addr: *mut c_void,
+        pub max_render_w: u32,
+        pub max_render_h: u32,
+        pub max_upscale_w: u32,
+        pub max_upscale_h: u32,
+        pub enable_hdr: u32,
+        pub inverted_depth: u32,
+    }
+
+    #[repr(C)]
+    pub struct EngineFsr31DispatchInfo {
+        pub vk_cmd: u64,
+        pub color_image: u64,
+        pub color_format: u32,
+        pub color_w: u32,
+        pub color_h: u32,
+        pub depth_image: u64,
+        pub depth_format: u32,
+        pub motion_image: u64,
+        pub motion_format: u32,
+        pub output_image: u64,
+        pub output_format: u32,
+        pub output_w: u32,
+        pub output_h: u32,
+        pub jitter_x: f32,
+        pub jitter_y: f32,
+        pub mv_scale_x: f32,
+        pub mv_scale_y: f32,
+        pub sharpness: f32,
+        pub frame_time_ms: f32,
+        pub camera_near: f32,
+        pub camera_far: f32,
+        pub fov_y_rad: f32,
+        pub reset: u32,
+    }
+
+    unsafe extern "C" {
+        pub fn engine_fsr31_create(info: *const EngineFsr31CreateInfo) -> *mut EngineFsr31Handle;
+        pub fn engine_fsr31_dispatch(
+            handle: *mut EngineFsr31Handle,
+            info: *const EngineFsr31DispatchInfo,
+        ) -> i32;
+        pub fn engine_fsr31_destroy(handle: *mut EngineFsr31Handle);
+    }
+}
+
+#[cfg(has_fsr31)]
+struct Fsr31Context(*mut fsr31_ffi::EngineFsr31Handle);
+
+#[cfg(has_fsr31)]
+unsafe impl Send for Fsr31Context {}
+#[cfg(has_fsr31)]
+unsafe impl Sync for Fsr31Context {}
+
 /// Standard FSR quality presets controlling internal render resolution scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsrPreset {
@@ -70,6 +137,8 @@ pub struct TemporalUpscalerPass {
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
     frame_counter: usize,
+    #[cfg(has_fsr31)]
+    fsr31_ctx: Option<Fsr31Context>,
 }
 
 impl TemporalUpscalerPass {
@@ -222,6 +291,32 @@ impl TemporalUpscalerPass {
             )?
         };
 
+        #[cfg(has_fsr31)]
+        let fsr31_ctx = {
+            let info = fsr31_ffi::EngineFsr31CreateInfo {
+                vk_device: vk::Handle::as_raw(rhi.device.handle()),
+                vk_physical_device: vk::Handle::as_raw(rhi.physical_device),
+                vk_get_device_proc_addr: rhi.instance.fp_v1_0().get_device_proc_addr
+                    as *mut std::ffi::c_void,
+                max_render_w: display_w,
+                max_render_h: display_h,
+                max_upscale_w: display_w,
+                max_upscale_h: display_h,
+                enable_hdr: 1,
+                inverted_depth: 0,
+            };
+            let handle = unsafe { fsr31_ffi::engine_fsr31_create(&info) };
+            if handle.is_null() {
+                log::warn!(
+                    "engine_fsr31_create failed; falling back to built-in GLSL FSR 3.1-style upscaler"
+                );
+                None
+            } else {
+                log::info!("Initialized official AMD FidelityFX FSR 3.1 (v1.1.4 SDK)");
+                Some(Fsr31Context(handle))
+            }
+        };
+
         Ok(Self {
             display_extent: vk::Extent2D {
                 width: display_w,
@@ -238,7 +333,18 @@ impl TemporalUpscalerPass {
             descriptor_pool,
             descriptor_sets: [sets[0], sets[1]],
             frame_counter: 0,
+            #[cfg(has_fsr31)]
+            fsr31_ctx,
         })
+    }
+
+    /// Returns the active upscaling backend name.
+    pub fn backend_name(&self) -> &'static str {
+        #[cfg(has_fsr31)]
+        if self.fsr31_ctx.is_some() {
+            return "AMD FidelityFX FSR 3.1 (v1.1.4 SDK)";
+        }
+        "Built-in GLSL FSR 3.1-style Temporal Upscaler"
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -253,6 +359,64 @@ impl TemporalUpscalerPass {
         sharpness: f32,
         slot_idx: usize,
     ) {
+        #[cfg(has_fsr31)]
+        if let Some(ctx) = self.fsr31_ctx.as_ref() {
+            let dev = &rhi.device;
+            let out_old = if self.out_initialized {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            };
+            let out_barrier = [sync::image_barrier(
+                self.out_upscaled.image,
+                out_old,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                self.out_upscaled.subresource_range(),
+            )];
+            unsafe {
+                sync::cmd_pipeline_barrier2(dev, cmd, &[], &[], &out_barrier);
+            }
+
+            let dispatch = fsr31_ffi::EngineFsr31DispatchInfo {
+                vk_cmd: vk::Handle::as_raw(cmd),
+                color_image: vk::Handle::as_raw(in_color.image),
+                color_format: in_color.format.as_raw() as u32,
+                color_w: in_color.extent.width,
+                color_h: in_color.extent.height,
+                depth_image: vk::Handle::as_raw(in_depth.image),
+                depth_format: in_depth.format.as_raw() as u32,
+                motion_image: vk::Handle::as_raw(in_motion.image),
+                motion_format: in_motion.format.as_raw() as u32,
+                output_image: vk::Handle::as_raw(self.out_upscaled.image),
+                output_format: self.out_upscaled.format.as_raw() as u32,
+                output_w: self.display_extent.width,
+                output_h: self.display_extent.height,
+                jitter_x: jitter[0],
+                jitter_y: jitter[1],
+                mv_scale_x: in_color.extent.width as f32,
+                mv_scale_y: in_color.extent.height as f32,
+                sharpness,
+                frame_time_ms: 16.666,
+                camera_near: 0.1,
+                camera_far: 1000.0,
+                fov_y_rad: 60.0_f32.to_radians(),
+                reset: u32::from(self.frame_counter == 0),
+            };
+            let rc = unsafe { fsr31_ffi::engine_fsr31_dispatch(ctx.0, &dispatch) };
+            if rc == 0 {
+                self.out_initialized = true;
+                self.frame_counter = self.frame_counter.wrapping_add(1);
+                return;
+            }
+            log::warn!(
+                "engine_fsr31_dispatch failed with code {rc}; falling back to built-in GLSL upscaler"
+            );
+        }
+
         let dev = &rhi.device;
         let slot = slot_idx % FRAMES_IN_FLIGHT;
         let read_idx = (self.frame_counter + 1) & 1;
@@ -398,6 +562,12 @@ impl TemporalUpscalerPass {
     }
 
     pub fn destroy(self, rhi: &mut RhiDevice) -> Result<(), EngineError> {
+        #[cfg(has_fsr31)]
+        if let Some(ctx) = self.fsr31_ctx {
+            unsafe {
+                fsr31_ffi::engine_fsr31_destroy(ctx.0);
+            }
+        }
         let dev = rhi.device.clone();
         unsafe {
             dev.destroy_descriptor_pool(self.descriptor_pool, None);

@@ -9,3 +9,4 @@ pipeline_cache_*.bin
 *~
 
 .nrd-sdk/
+.fsr31-sdk/

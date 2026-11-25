@@ -123,6 +123,7 @@ fn fsr31_temporal_upscaler_two_frames_validation() {
 
     let dev = rhi.device.clone();
     let mut upscaler = TemporalUpscalerPass::new(&mut rhi, 128, 128).expect("TemporalUpscalerPass");
+    eprintln!("Upscaler backend: {}", upscaler.backend_name());
 
     let in_color = GpuImage::create_2d(
         &dev,

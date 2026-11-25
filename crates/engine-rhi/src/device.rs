@@ -77,6 +77,7 @@ pub struct DeviceCapabilities {
     pub synchronization2: bool,
     pub dynamic_rendering: bool,
     pub shader_int64: bool,
+    pub shader_int16: bool,
     pub shader_float16: bool,
     pub vulkan_memory_model: bool,
     pub vulkan_memory_model_device_scope: bool,
@@ -678,6 +679,7 @@ fn probe_capabilities(
 
     unsafe { instance.get_physical_device_features2(pdev, &mut features2) };
     let shader_int64 = features2.features.shader_int64 != 0;
+    let shader_int16 = features2.features.shader_int16 != 0;
     let _ = features2;
 
     let cooperative_matrix_properties = if khr_cooperative_matrix {
@@ -756,6 +758,7 @@ fn probe_capabilities(
         synchronization2: v13.synchronization2 != 0,
         dynamic_rendering: v13.dynamic_rendering != 0,
         shader_int64,
+        shader_int16,
         shader_float16,
         vulkan_memory_model: v12.vulkan_memory_model != 0,
         vulkan_memory_model_device_scope: v12.vulkan_memory_model_device_scope != 0,
@@ -833,7 +836,9 @@ fn create_logical_device(
         enabled_exts.push(c"VK_KHR_compute_shader_derivatives".as_ptr());
     }
 
-    let core_features = vk::PhysicalDeviceFeatures::default().shader_int64(caps.shader_int64);
+    let core_features = vk::PhysicalDeviceFeatures::default()
+        .shader_int64(caps.shader_int64)
+        .shader_int16(caps.shader_int16);
 
     let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
         .buffer_device_address(caps.buffer_device_address)

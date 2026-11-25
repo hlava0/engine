@@ -3,6 +3,7 @@ name = "engine-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 engine-rhi = { path = "../engine-rhi" }
@@ -18,6 +19,9 @@ log.workspace = true
 winit.workspace = true
 egui.workspace = true
 egui-winit.workspace = true
+
+[build-dependencies]
+cc = "1.0"
 
 [dev-dependencies]
 env_logger.workspace = true

@@ -843,6 +843,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "cc",
  "egui",
  "egui-winit",
  "engine-assets",
