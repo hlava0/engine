@@ -69,3 +69,37 @@ fn full_engine_pipelined_frames_headless() {
         "Expected 0 Vulkan validation errors or sync hazards"
     );
 }
+
+#[test]
+fn hud_menu_overlay_and_settings_toggle_headless() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 256;
+
+    let world = create_demo_scene(WIDTH, HEIGHT);
+    let mut engine = Engine::new(world, WIDTH, HEIGHT, true).expect("Engine::new");
+    engine.hud_state.enabled = true;
+    engine.hud_state.menu_open = true;
+    engine.hud_state.selected_row = 1;
+    engine.hud_state.bow_charge = 0.75;
+    engine.hud_state.hit_flash = 0.5;
+    engine.hud_state.hud_lines = [
+        "SCORE:300  HITS:2  ARROWS:1/16".to_string(),
+        "FPS:240  GPU:1.20MS  NRD  [M] MENU".to_string(),
+    ];
+    engine.hud_state.menu_lines = vec![
+        "GRAPHICS & GAME MENU".to_string(),
+        "1. RT GI + REFLECTIONS : OFF".to_string(),
+        "2. HI-Z OCCLUSION CULL : ON".to_string(),
+    ];
+    engine.graphics_settings.enable_rt_gi = false;
+    engine.graphics_settings.fov_deg = 75.0;
+
+    for _ in 0..4 {
+        engine.render_frame(1.0 / 60.0).expect("render_frame");
+    }
+    engine.wait_idle().expect("wait_idle");
+    let pixels = engine.readback_output_rgba().expect("readback_output_rgba");
+    assert!(pixels.iter().any(|p| p[0] > 0.01 && p[1] > 0.01));
+    assert_eq!(engine.validation_errors(), 0);
+}

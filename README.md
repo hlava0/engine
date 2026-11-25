@@ -19,6 +19,25 @@ Lean, modular, code-first 3D rendering and gameplay engine in **Rust** targeting
 - **Vulkan 1.3 / 1.4 SDK**: Vulkan loader, validation layers (`VK_LAYER_KHRONOS_validation`), and `glslangValidator` in `PATH`
 - **NVIDIA NRD (Optional)**: Built-in GPL-3.0 SVGF denoising works out of the box with zero proprietary dependencies (or force it via `ENGINE_DISABLE_NRD=1`). To enable NVIDIA NRD (`REBLUR`), supply a local installation of the [NVIDIA Real-Time Denoisers (NRD) SDK](https://github.com/NVIDIA-RTX/NRD) (governed by the NVIDIA RTX SDKs License) — either build it manually with SPIR-V enabled or run `./scripts/fetch_nrd.sh --accept-nvidia-license`, then set `NRD_SDK_DIR` to the directory containing `Include/` and `lib/` (`libNRD.a`, `libShaderMakeBlob.a`).
 
+## Archery Range Game
+
+Run the playable 3D Archery Range game with walking, jumping, bow charging, projectile arrow physics, target scoring, audio chimes, and an in-game Graphics Settings Menu:
+
+```bash
+cargo run --release -p engine-core --bin archery_game
+```
+
+### Archery Game Controls
+
+| Input | Action |
+|---|---|
+| `W` / `A` / `S` / `D` | Walk |
+| `Space` / `Shift` | Jump / Sprint |
+| Click window / `Tab` | Lock or unlock mouse look (Arrow keys also look) |
+| Hold `Left Mouse` or `F` | Draw bow & release to shoot arrow |
+| `M` | Toggle in-game Graphics & Game Menu (`Up/Down` select, `Left/Right` change) |
+| `Esc` | Close menu / unlock cursor / quit |
+
 ## Interactive Viewer
 
 Run the windowed interactive viewer & ECS/physics/scripting sandbox:

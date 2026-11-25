@@ -18,10 +18,31 @@ use engine_rt_nrd::{
 };
 
 use crate::EngineError;
+use crate::hud::{HudOverlayPass, HudOverlayState};
 use crate::profiler::{GpuProfiler, PassTiming};
 use crate::scene::SceneWorld;
 
 const DENOISING_RANGE: f32 = 1000.0;
+
+/// Live-toggleable graphics settings controlled from the in-game Graphics Menu.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphicsSettings {
+    pub enable_hiz_culling: bool,
+    pub enable_rt_gi: bool,
+    pub enable_coop_ml: bool,
+    pub fov_deg: f32,
+}
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        Self {
+            enable_hiz_culling: true,
+            enable_rt_gi: true,
+            enable_coop_ml: true,
+            fov_deg: 65.0,
+        }
+    }
+}
 
 /// Per-frame CPU & GPU execution statistics.
 ///
@@ -56,10 +77,13 @@ pub struct Engine {
     nrd: Option<NrdDenoiser>,
     compose: Option<NrdComposePass>,
     coop_ml: Option<CoopMlPipeline>,
+    hud_pass: Option<HudOverlayPass>,
     output_image: Option<GpuImage>,
     frames: Vec<FrameSlot>,
     gpu_instances_scratch: Vec<GpuInstanceData>,
     pub world: SceneWorld,
+    pub graphics_settings: GraphicsSettings,
+    pub hud_state: HudOverlayState,
     pub width: u32,
     pub height: u32,
     frame_index: u32,
@@ -202,6 +226,7 @@ impl Engine {
         compose.bind_resources(&rhi.device, &nrd, &rt_pass, &gbuffer_pipe.targets);
 
         let coop_ml = CoopMlPipeline::new(&mut rhi, false)?;
+        let hud_pass = HudOverlayPass::new(&mut rhi)?;
 
         let dev = rhi.device.clone();
         let output_image = GpuImage::create_2d(
@@ -227,9 +252,15 @@ impl Engine {
             nrd: Some(nrd),
             compose: Some(compose),
             coop_ml: Some(coop_ml),
+            hud_pass: Some(hud_pass),
             output_image: Some(output_image),
             frames,
             gpu_instances_scratch,
+            graphics_settings: GraphicsSettings {
+                fov_deg: world.camera.fov_y_rad.to_degrees(),
+                ..Default::default()
+            },
+            hud_state: HudOverlayState::default(),
             world,
             width,
             height,
@@ -554,6 +585,7 @@ impl Engine {
         };
 
         // Step simulation and fill pre-allocated scratch buffer (zero heap allocation)
+        self.world.camera.fov_y_rad = self.graphics_settings.fov_deg.to_radians();
         self.world.step(dt);
         let any_transform_dirty = self.world.dirty_instances;
         if any_transform_dirty {
@@ -600,7 +632,7 @@ impl Engine {
             ],
             screen_size: [self.width, self.height],
             light_count: self.world.lights.len() as u32,
-            _pad: 0,
+            _pad: u32::from(!self.graphics_settings.enable_rt_gi),
         };
 
         let profiler = &mut self.frames[slot_idx].profiler;
@@ -629,7 +661,7 @@ impl Engine {
             cmd,
             gpu_scene,
             &uniforms,
-            self.has_hiz_history,
+            self.has_hiz_history && self.graphics_settings.enable_hiz_culling,
             slot_idx,
         )?;
         profiler.end_pass(&self.rhi.device, cmd, p_gbuf);
@@ -689,6 +721,11 @@ impl Engine {
             slot_idx,
         );
         profiler.end_pass(&self.rhi.device, cmd, p_ml);
+
+        // 7. In-game HUD / Crosshair / Graphics Menu Overlay
+        if let Some(hud) = self.hud_pass.as_mut() {
+            hud.dispatch(&self.rhi, cmd, out_img, slot_idx, &self.hud_state);
+        }
 
         Ok((draw_count, gpu_timings, record_start))
     }
@@ -806,6 +843,9 @@ impl Drop for Engine {
         }
         if let Some(img) = self.output_image.take() {
             let _ = img.destroy(&dev, self.rhi.allocator_mut());
+        }
+        if let Some(hud) = self.hud_pass.take() {
+            let _ = hud.destroy(&mut self.rhi);
         }
         if let Some(mut ml) = self.coop_ml.take() {
             let _ = ml.destroy(&mut self.rhi);

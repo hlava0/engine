@@ -1,6 +1,7 @@
 //! Data-oriented scene/ECS, GPU timestamp profiler, and full Vulkan 1.4 engine loop.
 
 pub mod engine;
+pub mod hud;
 pub mod pacer;
 pub mod profiler;
 pub mod scene;
@@ -11,7 +12,8 @@ use engine_rhi::ash::vk;
 use engine_rt_nrd::RtNrdError;
 use thiserror::Error;
 
-pub use engine::{Engine, FrameStats};
+pub use engine::{Engine, FrameStats, GraphicsSettings};
+pub use hud::HudOverlayState;
 pub use pacer::{FramePacer, PacerStats};
 pub use profiler::{GpuProfiler, PassTiming};
 pub use scene::{

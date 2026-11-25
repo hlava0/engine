@@ -1,0 +1,211 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D out_img;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HudDataBuf {
+    uint width;
+    uint height;
+    uint menu_open;
+    uint selected_row;
+    float bow_charge;
+    float hit_flash;
+    uint row_count;
+    uint enabled;
+    uvec4 hud_lines[8];   // 2 lines * 4 uvec4 (64 chars each)
+    uvec4 menu_lines[32]; // 8 lines * 4 uvec4 (64 chars each)
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    HudDataBuf data;
+} pc;
+
+// 5x6 bitmap font packed into 30 bits (row 0 = bits 25..29, row 5 = bits 0..4).
+uint font_5x6(uint ch) {
+    if (ch == 32u) return 0u; // ' '
+    if (ch == 43u) return (0x00u<<25)|(0x04u<<20)|(0x1Fu<<15)|(0x04u<<10)|(0x00u<<5)|0x00u; // '+'
+    if (ch == 45u) return (0x00u<<25)|(0x00u<<20)|(0x1Fu<<15)|(0x00u<<10)|(0x00u<<5)|0x00u; // '-'
+    if (ch == 46u) return (0x00u<<25)|(0x00u<<20)|(0x00u<<15)|(0x00u<<10)|(0x06u<<5)|0x06u; // '.'
+    if (ch == 47u) return (0x01u<<25)|(0x02u<<20)|(0x04u<<15)|(0x08u<<10)|(0x10u<<5)|0x00u; // '/'
+    if (ch == 58u) return (0x00u<<25)|(0x06u<<20)|(0x06u<<15)|(0x00u<<10)|(0x06u<<5)|0x06u; // ':'
+    if (ch == 62u) return (0x10u<<25)|(0x08u<<20)|(0x04u<<15)|(0x08u<<10)|(0x10u<<5)|0x00u; // '>'
+    if (ch == 91u) return (0x0Eu<<25)|(0x08u<<20)|(0x08u<<15)|(0x08u<<10)|(0x08u<<5)|0x0Eu; // '['
+    if (ch == 93u) return (0x0Eu<<25)|(0x02u<<20)|(0x02u<<15)|(0x02u<<10)|(0x02u<<5)|0x0Eu; // ']'
+    if (ch == 40u) return (0x04u<<25)|(0x08u<<20)|(0x08u<<15)|(0x08u<<10)|(0x08u<<5)|0x04u; // '('
+    if (ch == 41u) return (0x04u<<25)|(0x02u<<20)|(0x02u<<15)|(0x02u<<10)|(0x02u<<5)|0x04u; // ')'
+    if (ch == 37u) return (0x19u<<25)|(0x1Au<<20)|(0x04u<<15)|(0x0Bu<<10)|(0x13u<<5)|0x00u; // '%'
+
+    // Digits 0..9
+    if (ch == 48u) return (0x0Eu<<25)|(0x11u<<20)|(0x13u<<15)|(0x15u<<10)|(0x19u<<5)|0x0Eu;
+    if (ch == 49u) return (0x04u<<25)|(0x0Cu<<20)|(0x04u<<15)|(0x04u<<10)|(0x04u<<5)|0x0Eu;
+    if (ch == 50u) return (0x0Eu<<25)|(0x11u<<20)|(0x02u<<15)|(0x0Cu<<10)|(0x10u<<5)|0x1Fu;
+    if (ch == 51u) return (0x1Fu<<25)|(0x02u<<20)|(0x0Cu<<15)|(0x02u<<10)|(0x11u<<5)|0x0Eu;
+    if (ch == 52u) return (0x02u<<25)|(0x06u<<20)|(0x0Au<<15)|(0x12u<<10)|(0x1Fu<<5)|0x02u;
+    if (ch == 53u) return (0x1Fu<<25)|(0x10u<<20)|(0x1Eu<<15)|(0x01u<<10)|(0x11u<<5)|0x0Eu;
+    if (ch == 54u) return (0x0Eu<<25)|(0x10u<<20)|(0x1Eu<<15)|(0x11u<<10)|(0x11u<<5)|0x0Eu;
+    if (ch == 55u) return (0x1Fu<<25)|(0x01u<<20)|(0x02u<<15)|(0x04u<<10)|(0x08u<<5)|0x08u;
+    if (ch == 56u) return (0x0Eu<<25)|(0x11u<<20)|(0x0Eu<<15)|(0x11u<<10)|(0x11u<<5)|0x0Eu;
+    if (ch == 57u) return (0x0Eu<<25)|(0x11u<<20)|(0x0Fu<<15)|(0x01u<<10)|(0x11u<<5)|0x0Eu;
+
+    // Uppercase A..Z (65..90)
+    if (ch >= 97u && ch <= 122u) ch -= 32u;
+    if (ch == 65u) return (0x0Eu<<25)|(0x11u<<20)|(0x1Fu<<15)|(0x11u<<10)|(0x11u<<5)|0x11u; // A
+    if (ch == 66u) return (0x1Eu<<25)|(0x11u<<20)|(0x1Eu<<15)|(0x11u<<10)|(0x11u<<5)|0x1Eu; // B
+    if (ch == 67u) return (0x0Fu<<25)|(0x10u<<20)|(0x10u<<15)|(0x10u<<10)|(0x10u<<5)|0x0Fu; // C
+    if (ch == 68u) return (0x1Eu<<25)|(0x11u<<20)|(0x11u<<15)|(0x11u<<10)|(0x11u<<5)|0x1Eu; // D
+    if (ch == 69u) return (0x1Fu<<25)|(0x10u<<20)|(0x1Eu<<15)|(0x10u<<10)|(0x10u<<5)|0x1Fu; // E
+    if (ch == 70u) return (0x1Fu<<25)|(0x10u<<20)|(0x1Eu<<15)|(0x10u<<10)|(0x10u<<5)|0x10u; // F
+    if (ch == 71u) return (0x0Fu<<25)|(0x10u<<20)|(0x17u<<15)|(0x11u<<10)|(0x11u<<5)|0x0Fu; // G
+    if (ch == 72u) return (0x11u<<25)|(0x11u<<20)|(0x1Fu<<15)|(0x11u<<10)|(0x11u<<5)|0x11u; // H
+    if (ch == 73u) return (0x0Eu<<25)|(0x04u<<20)|(0x04u<<15)|(0x04u<<10)|(0x04u<<5)|0x0Eu; // I
+    if (ch == 74u) return (0x07u<<25)|(0x02u<<20)|(0x02u<<15)|(0x02u<<10)|(0x12u<<5)|0x0Cu; // J
+    if (ch == 75u) return (0x11u<<25)|(0x12u<<20)|(0x1Cu<<15)|(0x12u<<10)|(0x11u<<5)|0x11u; // K
+    if (ch == 76u) return (0x10u<<25)|(0x10u<<20)|(0x10u<<15)|(0x10u<<10)|(0x10u<<5)|0x1Fu; // L
+    if (ch == 77u) return (0x11u<<25)|(0x1Bu<<20)|(0x15u<<15)|(0x11u<<10)|(0x11u<<5)|0x11u; // M
+    if (ch == 78u) return (0x11u<<25)|(0x19u<<20)|(0x15u<<15)|(0x13u<<10)|(0x11u<<5)|0x11u; // N
+    if (ch == 79u) return (0x0Eu<<25)|(0x11u<<20)|(0x11u<<15)|(0x11u<<10)|(0x11u<<5)|0x0Eu; // O
+    if (ch == 80u) return (0x1Eu<<25)|(0x11u<<20)|(0x1Eu<<15)|(0x10u<<10)|(0x10u<<5)|0x10u; // P
+    if (ch == 81u) return (0x0Eu<<25)|(0x11u<<20)|(0x11u<<15)|(0x15u<<10)|(0x12u<<5)|0x0Du; // Q
+    if (ch == 82u) return (0x1Eu<<25)|(0x11u<<20)|(0x1Eu<<15)|(0x14u<<10)|(0x12u<<5)|0x11u; // R
+    if (ch == 83u) return (0x0Fu<<25)|(0x10u<<20)|(0x0Eu<<15)|(0x01u<<10)|(0x01u<<5)|0x1Eu; // S
+    if (ch == 84u) return (0x1Fu<<25)|(0x04u<<20)|(0x04u<<15)|(0x04u<<10)|(0x04u<<5)|0x04u; // T
+    if (ch == 85u) return (0x11u<<25)|(0x11u<<20)|(0x11u<<15)|(0x11u<<10)|(0x11u<<5)|0x0Eu; // U
+    if (ch == 86u) return (0x11u<<25)|(0x11u<<20)|(0x11u<<15)|(0x11u<<10)|(0x0Au<<5)|0x04u; // V
+    if (ch == 87u) return (0x11u<<25)|(0x11u<<20)|(0x11u<<15)|(0x15u<<10)|(0x1Bu<<5)|0x11u; // W
+    if (ch == 88u) return (0x11u<<25)|(0x0Au<<20)|(0x04u<<15)|(0x0Au<<10)|(0x11u<<5)|0x11u; // X
+    if (ch == 89u) return (0x11u<<25)|(0x0Au<<20)|(0x04u<<15)|(0x04u<<10)|(0x04u<<5)|0x04u; // Y
+    if (ch == 90u) return (0x1Fu<<25)|(0x02u<<20)|(0x04u<<15)|(0x08u<<10)|(0x10u<<5)|0x1Fu; // Z
+    return 0u;
+}
+
+uint read_hud_char(uint line_idx, uint char_idx) {
+    uint vec_idx = line_idx * 4u + (char_idx / 16u);
+    uvec4 v = pc.data.hud_lines[vec_idx];
+    uint word = v[(char_idx / 4u) & 3u];
+    return (word >> ((char_idx & 3u) * 8u)) & 0xFFu;
+}
+
+uint read_menu_char(uint line_idx, uint char_idx) {
+    uint vec_idx = line_idx * 4u + (char_idx / 16u);
+    uvec4 v = pc.data.menu_lines[vec_idx];
+    uint word = v[(char_idx / 4u) & 3u];
+    return (word >> ((char_idx & 3u) * 8u)) & 0xFFu;
+}
+
+bool sample_text_pixel(ivec2 px, ivec2 origin, uint scale, uint line_idx, bool is_menu) {
+    ivec2 rel = px - origin;
+    int cell_w = int(6u * scale);
+    int cell_h = int(8u * scale);
+    if (rel.x < 0 || rel.y < 0 || rel.y >= int(6u * scale) || rel.x >= 64 * cell_w) {
+        return false;
+    }
+    uint char_idx = uint(rel.x / cell_w);
+    int gx = (rel.x % cell_w) / int(scale);
+    int gy = rel.y / int(scale);
+    if (gx >= 5 || gy >= 6) {
+        return false;
+    }
+    uint ch = is_menu ? read_menu_char(line_idx, char_idx) : read_hud_char(line_idx, char_idx);
+    if (ch == 0u || ch == 32u) {
+        return false;
+    }
+    uint glyph = font_5x6(ch);
+    uint bit_idx = uint((5 - gy) * 5 + (4 - gx));
+    return ((glyph >> bit_idx) & 1u) != 0u;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    int w = int(pc.data.width);
+    int h = int(pc.data.height);
+    if (px.x >= w || px.y >= h || pc.data.enabled == 0u) {
+        return;
+    }
+
+    vec4 color = imageLoad(out_img, px);
+    uint scale = (w >= 900) ? 2u : 1u;
+
+    // 1. Top-left HUD bar
+    int hud_w = int(64u * 6u * scale) + 16;
+    int hud_h = int(2u * 8u * scale) + 12;
+    if (px.x >= 10 && px.x < 10 + hud_w && px.y >= 10 && px.y < 10 + hud_h) {
+        color.rgb = mix(color.rgb, vec3(0.02, 0.04, 0.07), 0.72);
+        if (px.x == 10 || px.x == 9 + hud_w || px.y == 10 || px.y == 9 + hud_h) {
+            color.rgb = vec3(0.25, 0.75, 0.95);
+        }
+        for (uint row = 0u; row < 2u; ++row) {
+            ivec2 orig = ivec2(18, 16 + int(row * 8u * scale));
+            if (sample_text_pixel(px, orig, scale, row, false)) {
+                color.rgb = (row == 0u) ? vec3(1.0, 0.92, 0.45) : vec3(0.85, 0.95, 1.0);
+            }
+        }
+    }
+
+    // 2. Center Crosshair + Bow Charge Bar (when menu is closed)
+    if (pc.data.menu_open == 0u) {
+        ivec2 c = ivec2(w / 2, h / 2);
+        ivec2 d = px - c;
+        int gap = int(mix(12.0, 4.0, pc.data.bow_charge));
+        int len = 7;
+        bool on_cross = (abs(d.y) <= 1 && abs(d.x) >= gap && abs(d.x) <= gap + len)
+                     || (abs(d.x) <= 1 && abs(d.y) >= gap && abs(d.y) <= gap + len)
+                     || (abs(d.x) <= 1 && abs(d.y) <= 1);
+        if (on_cross) {
+            vec3 cross_col = mix(vec3(0.95), vec3(1.0, 0.82, 0.15), pc.data.bow_charge);
+            color.rgb = cross_col;
+        }
+        if (pc.data.hit_flash > 0.01) {
+            int adx = abs(d.x);
+            int ady = abs(d.y);
+            if (abs(adx - ady) <= 1 && adx >= 4 && adx <= 12) {
+                color.rgb = mix(color.rgb, vec3(1.0, 0.25, 0.12), pc.data.hit_flash);
+            }
+        }
+        if (pc.data.bow_charge > 0.01) {
+            int bw = 80;
+            int bh = 6;
+            int bx = c.x - bw / 2;
+            int by = c.y + 24;
+            if (px.x >= bx && px.x < bx + bw && px.y >= by && px.y < by + bh) {
+                float frac = float(px.x - bx) / float(bw);
+                color.rgb = (frac <= pc.data.bow_charge)
+                    ? mix(vec3(0.2, 0.9, 0.4), vec3(1.0, 0.75, 0.1), pc.data.bow_charge)
+                    : vec3(0.08, 0.08, 0.12);
+            }
+        }
+    } else {
+        // 3. Graphics & Game Settings Menu Overlay
+        uint rows = min(pc.data.row_count, 8u);
+        int line_h = int(10u * scale);
+        int panel_w = min(w - 32, int(52u * 6u * scale) + 28);
+        int panel_h = int(rows) * line_h + 28;
+        int x0 = (w - panel_w) / 2;
+        int y0 = (h - panel_h) / 2;
+        if (px.x >= x0 && px.x < x0 + panel_w && px.y >= y0 && px.y < y0 + panel_h) {
+            color.rgb = mix(color.rgb, vec3(0.03, 0.05, 0.09), 0.88);
+            if (px.x <= x0 + 1 || px.x >= x0 + panel_w - 2 || px.y <= y0 + 1 || px.y >= y0 + panel_h - 2) {
+                color.rgb = vec3(0.30, 0.82, 1.0);
+            }
+            for (uint r = 0u; r < rows; ++r) {
+                int ry = y0 + 14 + int(r) * line_h;
+                if (r == pc.data.selected_row && px.y >= ry - 2 && px.y < ry + int(7u * scale)) {
+                    color.rgb = mix(color.rgb, vec3(0.12, 0.32, 0.48), 0.75);
+                }
+                if (sample_text_pixel(px, ivec2(x0 + 14, ry), scale, r, true)) {
+                    if (r == 0u) {
+                        color.rgb = vec3(0.40, 0.88, 1.0);
+                    } else if (r == pc.data.selected_row) {
+                        color.rgb = vec3(1.0, 0.92, 0.35);
+                    } else {
+                        color.rgb = vec3(0.92, 0.95, 0.98);
+                    }
+                }
+            }
+        }
+    }
+
+    imageStore(out_img, px, color);
+}

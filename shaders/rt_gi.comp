@@ -298,22 +298,32 @@ void main() {
     float diff_hit_accum = 0.0;
     float spec_hit_accum = 0.0;
 
-    for (int s = 0; s < spp; ++s) {
-        // Secondary diffuse GI ray
-        vec3 diff_dir = sample_cosine_hemisphere(N, seed);
-        SecondaryHit dh = trace_secondary(world_pos + N * RAY_TMIN, diff_dir, sun_dir, sun_energy, denoising_range);
-        diff_accum += direct_diff + diff_albedo * dh.radiance;
-        diff_hit_accum += dh.hit_dist;
+    if (pc.params._pad != 0u) {
+        // Fast non-GI mode (toggled from Graphics Menu): direct lighting + hemisphere ambient
+        vec3 amb_sky = sky_radiance(N, sun_dir, sun_energy);
+        diff_accum = direct_diff + diff_albedo * amb_sky * 0.35;
+        spec_accum = fresnel * amb_sky * 0.25;
+        diff_hit_accum = 2.0;
+        spec_hit_accum = 2.0;
+        spp = 1;
+    } else {
+        for (int s = 0; s < spp; ++s) {
+            // Secondary diffuse GI ray
+            vec3 diff_dir = sample_cosine_hemisphere(N, seed);
+            SecondaryHit dh = trace_secondary(world_pos + N * RAY_TMIN, diff_dir, sun_dir, sun_energy, denoising_range);
+            diff_accum += direct_diff + diff_albedo * dh.radiance;
+            diff_hit_accum += dh.hit_dist;
 
-        // Secondary specular reflection ray
-        vec3 refl = reflect(-V, N);
-        vec3 spec_dir = normalize(mix(refl, sample_cosine_hemisphere(N, seed), roughness * roughness));
-        if (dot(spec_dir, N) <= 0.0) {
-            spec_dir = refl;
+            // Secondary specular reflection ray
+            vec3 refl = reflect(-V, N);
+            vec3 spec_dir = normalize(mix(refl, sample_cosine_hemisphere(N, seed), roughness * roughness));
+            if (dot(spec_dir, N) <= 0.0) {
+                spec_dir = refl;
+            }
+            SecondaryHit sh = trace_secondary(world_pos + N * RAY_TMIN, spec_dir, sun_dir, sun_energy, denoising_range);
+            spec_accum += fresnel * sh.radiance;
+            spec_hit_accum += sh.hit_dist;
         }
-        SecondaryHit sh = trace_secondary(world_pos + N * RAY_TMIN, spec_dir, sun_dir, sun_energy, denoising_range);
-        spec_accum += fresnel * sh.radiance;
-        spec_hit_accum += sh.hit_dist;
     }
 
     diff_accum /= float(spp);
