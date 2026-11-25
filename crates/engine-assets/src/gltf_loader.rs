@@ -32,6 +32,9 @@ pub struct LoadedMaterial {
     pub normal_texture: Option<usize>,
     pub metallic_roughness_texture: Option<usize>,
     pub emissive_texture: Option<usize>,
+    /// `0` = OPAQUE, `1` = MASK, `2` = BLEND.
+    pub alpha_mode: u32,
+    pub alpha_cutoff: f32,
 }
 
 impl Default for LoadedMaterial {
@@ -46,8 +49,32 @@ impl Default for LoadedMaterial {
             normal_texture: None,
             metallic_roughness_texture: None,
             emissive_texture: None,
+            alpha_mode: 0,
+            alpha_cutoff: 0.5,
         }
     }
+}
+
+/// Keyframe channel extracted from a `gltf::Animation` targeting a node/joint index.
+#[derive(Debug, Clone)]
+pub enum AnimationProperty {
+    Translation(Vec<[f32; 3]>),
+    Rotation(Vec<[f32; 4]>),
+    Scale(Vec<[f32; 3]>),
+}
+
+#[derive(Debug, Clone)]
+pub struct AnimationChannelData {
+    pub target_node: usize,
+    pub timestamps: Vec<f32>,
+    pub property: AnimationProperty,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedAnimation {
+    pub name: String,
+    pub duration: f32,
+    pub channels: Vec<AnimationChannelData>,
 }
 
 /// A scene graph instance referencing a [`LoadedMesh`] and [`LoadedMaterial`] with a world transform.
@@ -67,6 +94,7 @@ pub struct LoadedScene {
     pub materials: Vec<LoadedMaterial>,
     pub instances: Vec<LoadedInstance>,
     pub textures: Vec<TextureData>,
+    pub animations: Vec<LoadedAnimation>,
 }
 
 /// Load a glTF 2.0 (`.gltf` or `.glb`) file from disk.
@@ -145,6 +173,12 @@ fn extract_scene(
                     .metallic_roughness_texture()
                     .map(|t| t.texture().source().index()),
                 emissive_texture: mat.emissive_texture().map(|t| t.texture().source().index()),
+                alpha_mode: match mat.alpha_mode() {
+                    gltf::material::AlphaMode::Opaque => 0,
+                    gltf::material::AlphaMode::Mask => 1,
+                    gltf::material::AlphaMode::Blend => 2,
+                },
+                alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
             }
         })
         .collect();
@@ -283,11 +317,58 @@ fn extract_scene(
         ));
     }
 
+    // 4. Extract glTF animation clips & keyframe channels
+    let animations: Vec<LoadedAnimation> = document
+        .animations()
+        .enumerate()
+        .map(|(idx, anim)| {
+            let mut duration = 0.0f32;
+            let mut channels = Vec::new();
+            for ch in anim.channels() {
+                let target_node = ch.target().node().index();
+                let reader = ch.reader(|b| Some(&buffers[b.index()]));
+                let timestamps: Vec<f32> = reader
+                    .read_inputs()
+                    .map(|it| it.collect())
+                    .unwrap_or_default();
+                if let Some(&last_t) = timestamps.last() {
+                    duration = duration.max(last_t);
+                }
+                let property = match reader.read_outputs() {
+                    Some(gltf::animation::util::ReadOutputs::Translations(it)) => {
+                        AnimationProperty::Translation(it.collect())
+                    }
+                    Some(gltf::animation::util::ReadOutputs::Rotations(it)) => {
+                        AnimationProperty::Rotation(it.into_f32().collect())
+                    }
+                    Some(gltf::animation::util::ReadOutputs::Scales(it)) => {
+                        AnimationProperty::Scale(it.collect())
+                    }
+                    _ => continue,
+                };
+                channels.push(AnimationChannelData {
+                    target_node,
+                    timestamps,
+                    property,
+                });
+            }
+            LoadedAnimation {
+                name: anim
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("anim_{idx}")),
+                duration,
+                channels,
+            }
+        })
+        .collect();
+
     Ok(LoadedScene {
         meshes,
         materials,
         instances,
         textures,
+        animations,
     })
 }
 

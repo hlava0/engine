@@ -863,7 +863,8 @@ fn create_logical_device(
         .synchronization2(caps.synchronization2)
         .dynamic_rendering(caps.dynamic_rendering)
         .subgroup_size_control(caps.subgroup_size_control)
-        .compute_full_subgroups(caps.compute_full_subgroups);
+        .compute_full_subgroups(caps.compute_full_subgroups)
+        .shader_demote_to_helper_invocation(true);
 
     let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
         .acceleration_structure(true);

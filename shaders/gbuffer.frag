@@ -9,6 +9,10 @@ struct GpuMaterialTextures {
     uint normal_tex;
     uint metallic_roughness_tex;
     uint emissive_tex;
+    uint alpha_mode;
+    float alpha_cutoff;
+    uint _pad0;
+    uint _pad1;
 };
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialTexturesBuf {
@@ -76,6 +80,9 @@ void main() {
                 sampler2D(bindless_textures[nonuniformEXT(mt.albedo_tex)], bindless_samplers[s_idx]),
                 in_uv
             );
+            if (mt.alpha_mode == 1u && tex_col.a < mt.alpha_cutoff) {
+                discard;
+            }
             albedo *= tex_col.rgb;
         }
         if (mt.metallic_roughness_tex != 0xFFFFFFFFu) {

@@ -4,14 +4,14 @@ use std::ffi::CStr;
 use std::time::Instant;
 
 use engine_compute_ml::CoopMlPipeline;
-use engine_gpu_driven::{GpuDrivenPipeline, GpuInstanceData, GpuScene};
+use engine_gpu_driven::{ComputeSkinningPass, GpuDrivenPipeline, GpuInstanceData, GpuScene};
 use engine_rhi::ash::vk;
 use engine_rhi::ash_window;
 use engine_rhi::gpu_allocator::MemoryLocation;
 use engine_rhi::raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use engine_rhi::{
-    BindlessConfig, BindlessTable, CoopMatrixTile, FRAMES_IN_FLIGHT, GpuBuffer, GpuImage,
-    RhiConfig, RhiDevice, Swapchain, VendorProfile, sync,
+    AsyncQueueContext, BindlessConfig, BindlessTable, CoopMatrixTile, FRAMES_IN_FLIGHT, GpuBuffer,
+    GpuImage, RhiConfig, RhiDevice, Swapchain, VendorProfile, sync,
 };
 use engine_rt_nrd::{
     AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RT_FLAG_CHECKERBOARD,
@@ -22,7 +22,9 @@ use crate::EngineError;
 use crate::egui_renderer::EguiVulkanRenderer;
 use crate::hud::{HudOverlayPass, HudOverlayState};
 use crate::profiler::{GpuProfiler, PassTiming};
+use crate::render_graph::{RenderGraph, RgAccess, RgImageId};
 use crate::scene::SceneWorld;
+use crate::upscaler::{FsrPreset, TemporalUpscalerPass};
 
 const DENOISING_RANGE: f32 = 1000.0;
 
@@ -34,6 +36,8 @@ pub struct GraphicsSettings {
     pub checkerboard_gi: bool,
     pub restir_gi: bool,
     pub enable_coop_ml: bool,
+    pub enable_upscaler: bool,
+    pub fsr_preset: FsrPreset,
     pub fov_deg: f32,
 }
 
@@ -45,6 +49,8 @@ impl Default for GraphicsSettings {
             checkerboard_gi: false,
             restir_gi: true,
             enable_coop_ml: true,
+            enable_upscaler: true,
+            fsr_preset: FsrPreset::Native,
             fov_deg: 65.0,
         }
     }
@@ -83,8 +89,13 @@ pub struct Engine {
     nrd: Option<NrdDenoiser>,
     compose: Option<NrdComposePass>,
     coop_ml: Option<CoopMlPipeline>,
+    upscaler: Option<TemporalUpscalerPass>,
+    skinning_pass: Option<ComputeSkinningPass>,
     hud_pass: Option<HudOverlayPass>,
     egui_renderer: Option<EguiVulkanRenderer>,
+    async_queues: Option<AsyncQueueContext>,
+    render_graph: RenderGraph,
+    rg_out_id: RgImageId,
     output_image: Option<GpuImage>,
     frames: Vec<FrameSlot>,
     gpu_instances_scratch: Vec<GpuInstanceData>,
@@ -233,7 +244,10 @@ impl Engine {
         compose.bind_resources(&rhi.device, &nrd, &rt_pass, &gbuffer_pipe.targets);
 
         let coop_ml = CoopMlPipeline::new(&mut rhi, false)?;
+        let upscaler = TemporalUpscalerPass::new(&mut rhi, width, height)?;
+        let skinning_pass = ComputeSkinningPass::new(&rhi)?;
         let hud_pass = HudOverlayPass::new(&mut rhi)?;
+        let async_queues = AsyncQueueContext::new(&rhi)?;
         let egui_renderer = if let Some(sc) = swapchain.as_ref() {
             Some(EguiVulkanRenderer::new(&rhi, sc.format)?)
         } else {
@@ -248,10 +262,20 @@ impl Engine {
             height,
             1,
             vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
             "engine_final_output",
         )?;
+
+        let mut render_graph = RenderGraph::new();
+        let rg_out_id = render_graph.register_image(
+            "engine_final_output",
+            output_image.image,
+            output_image.subresource_range(),
+            vk::ImageLayout::UNDEFINED,
+        );
 
         Ok(Self {
             rhi,
@@ -264,8 +288,13 @@ impl Engine {
             nrd: Some(nrd),
             compose: Some(compose),
             coop_ml: Some(coop_ml),
+            upscaler: Some(upscaler),
+            skinning_pass: Some(skinning_pass),
             hud_pass: Some(hud_pass),
             egui_renderer,
+            async_queues: Some(async_queues),
+            render_graph,
+            rg_out_id,
             output_image: Some(output_image),
             frames,
             gpu_instances_scratch,
@@ -384,6 +413,23 @@ impl Engine {
         })
     }
 
+    /// Access the active final output image (`upscaler.out_upscaled` when upscaling is enabled,
+    /// otherwise `output_image`).
+    fn final_output_image(&self) -> &GpuImage {
+        if self.graphics_settings.enable_upscaler
+            && let Some(up) = self.upscaler.as_ref()
+        {
+            &up.out_upscaled
+        } else {
+            self.output_image.as_ref().expect("output_image")
+        }
+    }
+
+    /// Access the async `transfer_queue` / `compute_queue` timeline context.
+    pub fn async_queues(&mut self) -> Option<&mut AsyncQueueContext> {
+        self.async_queues.as_mut()
+    }
+
     /// Execute one full pipelined frame and blit + present the post-processed output to the window swapchain.
     ///
     /// Returns `Ok((stats, needs_recreate))`, where `needs_recreate` is `true` if the swapchain
@@ -466,8 +512,11 @@ impl Engine {
         let (draw_count, gpu_timings, record_start) =
             self.record_render_passes(cmd, dt, frame_idx, slot_idx, is_first)?;
 
-        // Blit CoopML output_image (GENERAL) -> swapchain_image (TRANSFER_DST -> PRESENT_SRC_KHR)
-        let out_img = self.output_image.as_ref().expect("output_image");
+        // Blit final output image (GENERAL) -> swapchain_image (TRANSFER_DST -> PRESENT_SRC_KHR)
+        let out_img_handle = self.final_output_image().image;
+        let out_img_range = self.final_output_image().subresource_range();
+        let out_img_w = self.final_output_image().extent.width;
+        let out_img_h = self.final_output_image().extent.height;
         let color_subresource = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -477,14 +526,14 @@ impl Engine {
         };
         let pre_blit_barriers = [
             sync::image_barrier(
-                out_img.image,
+                out_img_handle,
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
-                out_img.subresource_range(),
+                out_img_range,
             ),
             sync::image_barrier(
                 swapchain_image,
@@ -511,8 +560,8 @@ impl Engine {
             .src_offsets([
                 vk::Offset3D { x: 0, y: 0, z: 0 },
                 vk::Offset3D {
-                    x: self.width as i32,
-                    y: self.height as i32,
+                    x: out_img_w as i32,
+                    y: out_img_h as i32,
                     z: 1,
                 },
             ])
@@ -531,7 +580,7 @@ impl Engine {
                 },
             ])];
         let blit_info = vk::BlitImageInfo2::default()
-            .src_image(out_img.image)
+            .src_image(out_img_handle)
             .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             .dst_image(swapchain_image)
             .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -588,14 +637,14 @@ impl Engine {
                     color_subresource,
                 ),
                 sync::image_barrier(
-                    out_img.image,
+                    out_img_handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::GENERAL,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    out_img.subresource_range(),
+                    out_img_range,
                 ),
             ];
             unsafe {
@@ -615,14 +664,14 @@ impl Engine {
                     color_subresource,
                 ),
                 sync::image_barrier(
-                    out_img.image,
+                    out_img_handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::GENERAL,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    out_img.subresource_range(),
+                    out_img_range,
                 ),
             ];
             unsafe {
@@ -837,9 +886,68 @@ impl Engine {
         );
         profiler.end_pass(&self.rhi.device, cmd, p_ml);
 
-        // 7. In-game HUD / Crosshair / Graphics Menu Overlay
+        // 7. FSR 3.1 Temporal Upscaling + RCAS (via RenderGraph barriers)
+        if self.graphics_settings.enable_upscaler
+            && let Some(upscaler) = self.upscaler.as_mut()
+        {
+            let p_up = profiler.begin_pass(&self.rhi.device, cmd, "FSR31Upscale");
+            let mut rg_accesses = vec![RgAccess {
+                resource: self.rg_out_id,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                access: vk::AccessFlags2::SHADER_SAMPLED_READ,
+            }];
+            if nrd.is_using_nrd() {
+                let mv_barrier = [sync::image_barrier(
+                    gbuffer_pipe.targets.motion.image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    gbuffer_pipe.targets.motion.subresource_range(),
+                )];
+                unsafe {
+                    sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &mv_barrier);
+                }
+            }
+            self.render_graph
+                .emit_pass_barriers(&self.rhi.device, cmd, &rg_accesses);
+            rg_accesses.clear();
+            upscaler.record(
+                &self.rhi,
+                cmd,
+                out_img,
+                &gbuffer_pipe.targets.motion,
+                &gbuffer_pipe.targets.depth,
+                self.world.camera.jitter,
+                0.5,
+                slot_idx,
+            );
+            self.render_graph.emit_pass_barriers(
+                &self.rhi.device,
+                cmd,
+                &[RgAccess {
+                    resource: self.rg_out_id,
+                    layout: vk::ImageLayout::GENERAL,
+                    stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    access: vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                }],
+            );
+            profiler.end_pass(&self.rhi.device, cmd, p_up);
+        }
+
+        // 8. In-game HUD / Crosshair / Graphics Menu Overlay
+        let final_out = if self.graphics_settings.enable_upscaler
+            && let Some(upscaler) = self.upscaler.as_ref()
+        {
+            &upscaler.out_upscaled
+        } else {
+            out_img
+        };
         if let Some(hud) = self.hud_pass.as_mut() {
-            hud.dispatch(&self.rhi, cmd, out_img, slot_idx, &self.hud_state);
+            hud.dispatch(&self.rhi, cmd, final_out, slot_idx, &self.hud_state);
         }
 
         Ok((draw_count, gpu_timings, record_start))
@@ -864,7 +972,11 @@ impl Engine {
             MemoryLocation::GpuToCpu,
         )?;
 
-        let out_img = self.output_image.as_ref().expect("output_image");
+        let out_img = self.final_output_image();
+        let out_image = out_img.image;
+        let out_range = out_img.subresource_range();
+        let out_w = out_img.extent.width;
+        let out_h = out_img.extent.height;
         let pool = self.frames[0].command_pool;
         let cmd = self.frames[0].cmd;
         unsafe {
@@ -875,14 +987,14 @@ impl Engine {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
             let to_src = [sync::image_barrier(
-                out_img.image,
+                out_image,
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::ALL_COMMANDS,
                 vk::AccessFlags2::MEMORY_WRITE,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
-                out_img.subresource_range(),
+                out_range,
             )];
             sync::cmd_pipeline_barrier2(&dev, cmd, &[], &[], &to_src);
 
@@ -894,27 +1006,27 @@ impl Engine {
                     layer_count: 1,
                 })
                 .image_extent(vk::Extent3D {
-                    width: self.width,
-                    height: self.height,
+                    width: out_w,
+                    height: out_h,
                     depth: 1,
                 });
             dev.cmd_copy_image_to_buffer(
                 cmd,
-                out_img.image,
+                out_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 staging.buffer,
                 &[region],
             );
 
             let to_gen = [sync::image_barrier(
-                out_img.image,
+                out_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ,
                 vk::PipelineStageFlags2::ALL_COMMANDS,
                 vk::AccessFlags2::NONE,
-                out_img.subresource_range(),
+                out_range,
             )];
             sync::cmd_pipeline_barrier2(&dev, cmd, &[], &[], &to_gen);
             dev.end_command_buffer(cmd)?;
@@ -958,6 +1070,15 @@ impl Drop for Engine {
         }
         if let Some(img) = self.output_image.take() {
             let _ = img.destroy(&dev, self.rhi.allocator_mut());
+        }
+        if let Some(aq) = self.async_queues.take() {
+            aq.destroy(&self.rhi);
+        }
+        if let Some(sk) = self.skinning_pass.take() {
+            sk.destroy(&self.rhi);
+        }
+        if let Some(up) = self.upscaler.take() {
+            let _ = up.destroy(&mut self.rhi);
         }
         if let Some(egui_vk) = self.egui_renderer.take() {
             let _ = egui_vk.destroy(&mut self.rhi);
