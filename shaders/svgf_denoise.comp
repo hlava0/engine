@@ -1,0 +1,156 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform SvgfPushConstants {
+    uint width;
+    uint height;
+    uint is_first_frame;
+    float alpha;
+    float denoising_range;
+    float depth_sigma;
+    float normal_power;
+    float _pad;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2D in_diff_rad_hitdist;
+layout(set = 0, binding = 1) uniform sampler2D in_spec_rad_hitdist;
+layout(set = 0, binding = 2) uniform sampler2D in_normal_roughness;
+layout(set = 0, binding = 3) uniform sampler2D in_view_z;
+layout(set = 0, binding = 4) uniform sampler2D in_motion;
+layout(set = 0, binding = 5) uniform sampler2D history_diff;
+layout(set = 0, binding = 6) uniform sampler2D history_spec;
+layout(set = 0, binding = 7) uniform sampler2D history_view_z;
+
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D out_diff;
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D out_spec;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D next_history_diff;
+layout(set = 0, binding = 11, rgba16f) uniform writeonly image2D next_history_spec;
+layout(set = 0, binding = 12, r16f) uniform writeonly image2D next_history_view_z;
+
+// Inverse of nrd_encode_normal_roughness in rt_gi.comp (R10_G10_B10_A2_UNORM octahedral packing)
+void decode_nrd_normal_roughness(vec3 enc, out vec3 n, out float roughness) {
+    float nx = enc.x - enc.y;
+    float ny = enc.x + enc.y - 1.0;
+    float s = enc.z * 2.0 - 1.0;
+    roughness = abs(s);
+    float nz = (1.0 - abs(nx) - abs(ny)) * (s < 0.0 ? -1.0 : 1.0);
+    float len = length(vec3(nx, ny, nz));
+    n = len > 1e-5 ? vec3(nx, ny, nz) / len : vec3(0.0, 1.0, 0.0);
+}
+
+bool vec4_is_finite(vec4 v) {
+    return !any(isnan(v)) && !any(isinf(v));
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (texel.x >= int(pc.width) || texel.y >= int(pc.height)) {
+        return;
+    }
+
+    float center_z = texelFetch(in_view_z, texel, 0).r;
+    vec4 center_diff = texelFetch(in_diff_rad_hitdist, texel, 0);
+    vec4 center_spec = texelFetch(in_spec_rad_hitdist, texel, 0);
+
+    if (!vec4_is_finite(center_diff)) {
+        center_diff = vec4(0.0);
+    }
+    if (!vec4_is_finite(center_spec)) {
+        center_spec = vec4(0.0);
+    }
+
+    // Sky / background pixels pass straight through without filtering
+    if (center_z <= 0.0 || center_z >= pc.denoising_range) {
+        imageStore(out_diff, texel, center_diff);
+        imageStore(out_spec, texel, center_spec);
+        imageStore(next_history_diff, texel, center_diff);
+        imageStore(next_history_spec, texel, center_spec);
+        imageStore(next_history_view_z, texel, vec4(center_z, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec3 center_n;
+    float center_roughness;
+    decode_nrd_normal_roughness(texelFetch(in_normal_roughness, texel, 0).rgb, center_n, center_roughness);
+
+    // 3x3 edge-stopping bilateral spatial filter weighted by normal similarity & view_z depth delta
+    const float k_weights[3] = float[3](1.0, 2.0, 1.0);
+    vec4 diff_sum = vec4(0.0);
+    vec4 spec_sum = vec4(0.0);
+    float diff_w_sum = 0.0;
+    float spec_w_sum = 0.0;
+
+    ivec2 max_coord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+    float inv_z_norm = 1.0 / max(center_z, 0.05);
+    float inv_depth_sigma = 1.0 / max(pc.depth_sigma, 1e-4);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 p = clamp(texel + ivec2(dx, dy), ivec2(0), max_coord);
+            float nz = texelFetch(in_view_z, p, 0).r;
+            if (nz <= 0.0 || nz >= pc.denoising_range) {
+                continue;
+            }
+
+            vec3 nn;
+            float nrough;
+            decode_nrd_normal_roughness(texelFetch(in_normal_roughness, p, 0).rgb, nn, nrough);
+
+            float kw = k_weights[dx + 1] * k_weights[dy + 1];
+            float rel_dz = abs(nz - center_z) * inv_z_norm;
+            float w_z = exp(-rel_dz * inv_depth_sigma);
+            float w_n = pow(max(dot(center_n, nn), 0.0), pc.normal_power);
+            float w_r = exp(-abs(nrough - center_roughness) * 8.0);
+
+            float w_diff = kw * w_z * w_n;
+            float w_spec = w_diff * w_r;
+
+            vec4 sd = texelFetch(in_diff_rad_hitdist, p, 0);
+            vec4 ss = texelFetch(in_spec_rad_hitdist, p, 0);
+            if (vec4_is_finite(sd)) {
+                diff_sum += sd * w_diff;
+                diff_w_sum += w_diff;
+            }
+            if (vec4_is_finite(ss)) {
+                spec_sum += ss * w_spec;
+                spec_w_sum += w_spec;
+            }
+        }
+    }
+
+    vec4 spatial_diff = diff_w_sum > 1e-5 ? (diff_sum / diff_w_sum) : center_diff;
+    vec4 spatial_spec = spec_w_sum > 1e-5 ? (spec_sum / spec_w_sum) : center_spec;
+
+    // Temporal reprojection via motion vectors (prev_uv = cur_uv + mv) with disocclusion rejection
+    vec4 final_diff = spatial_diff;
+    vec4 final_spec = spatial_spec;
+
+    if (pc.is_first_frame == 0u) {
+        vec2 cur_uv = (vec2(texel) + 0.5) / vec2(float(pc.width), float(pc.height));
+        vec2 mv = texelFetch(in_motion, texel, 0).rg;
+        vec2 prev_uv = cur_uv + mv;
+
+        bool in_bounds = prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0;
+        if (in_bounds) {
+            float prev_z = textureLod(history_view_z, prev_uv, 0.0).r;
+            float z_delta = abs(prev_z - center_z) * inv_z_norm;
+            if (prev_z > 0.0 && prev_z < pc.denoising_range && z_delta < 0.05) {
+                vec4 hist_diff = textureLod(history_diff, prev_uv, 0.0);
+                vec4 hist_spec = textureLod(history_spec, prev_uv, 0.0);
+                if (vec4_is_finite(hist_diff)) {
+                    final_diff = mix(hist_diff, spatial_diff, pc.alpha);
+                }
+                if (vec4_is_finite(hist_spec)) {
+                    final_spec = mix(hist_spec, spatial_spec, pc.alpha);
+                }
+            }
+        }
+    }
+
+    imageStore(out_diff, texel, final_diff);
+    imageStore(out_spec, texel, final_spec);
+    imageStore(next_history_diff, texel, final_diff);
+    imageStore(next_history_spec, texel, final_spec);
+    imageStore(next_history_view_z, texel, vec4(center_z, 0.0, 0.0, 0.0));
+}

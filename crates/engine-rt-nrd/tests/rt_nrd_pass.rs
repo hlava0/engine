@@ -9,8 +9,8 @@ use engine_gpu_driven::{
 use engine_rhi::gpu_allocator::MemoryLocation;
 use engine_rhi::{BindlessConfig, BindlessTable, GpuBuffer, RhiConfig, RhiDevice, sync};
 use engine_rt_nrd::{
-    AccelStructureManager, GpuRtLight, GpuRtMaterial, NrdComposePass, NrdDenoiser, NrdInputs,
-    RtGiPass, RtParams,
+    AccelStructureManager, DenoiserMode, GpuRtLight, GpuRtMaterial, NrdComposePass, NrdDenoiser,
+    NrdInputs, RtGiPass, RtParams,
 };
 
 fn unit_cube_mesh() -> (Vec<GpuVertex>, Vec<u32>, GpuMeshDrawInfo) {
@@ -131,14 +131,14 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-#[test]
-fn headless_rt_nrd_two_frames_zero_validation_errors() {
+fn run_rt_denoiser_test(mode: DenoiserMode) {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let mut rhi = RhiDevice::new(RhiConfig {
-        app_name: "rt-nrd-pass-test".to_string(),
+        app_name: format!("rt-nrd-pass-test-{mode:?}"),
         enable_validation: true,
         enable_sync_validation: true,
+        ..Default::default()
     })
     .expect("Failed to initialize RhiDevice");
 
@@ -255,7 +255,17 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
 
     let mut rt_pass = RtGiPass::new(&mut rhi, WIDTH, HEIGHT, &materials, &lights)
         .expect("Failed to create RtGiPass");
-    let mut nrd = NrdDenoiser::new(&mut rhi, WIDTH, HEIGHT).expect("Failed to create NrdDenoiser");
+    let mut nrd = NrdDenoiser::new_with_mode(&mut rhi, WIDTH, HEIGHT, mode)
+        .expect("Failed to create NrdDenoiser");
+    println!(
+        "Testing denoiser mode={mode:?} -> backend='{}' (is_using_nrd={})",
+        nrd.backend_name(),
+        nrd.is_using_nrd()
+    );
+    if mode == DenoiserMode::Svgf {
+        assert!(!nrd.is_using_nrd());
+        assert_eq!(nrd.backend_name(), "Built-in SVGF (GPL-3.0)");
+    }
     let mut compose =
         NrdComposePass::new(&mut rhi, WIDTH, HEIGHT).expect("Failed to create NrdComposePass");
 
@@ -443,4 +453,14 @@ fn headless_rt_nrd_two_frames_zero_validation_errors() {
     scene.destroy(&mut rhi).unwrap();
     gbuffer_pipe.destroy(&mut rhi).unwrap();
     bindless.destroy(&device);
+}
+
+#[test]
+fn headless_rt_nrd_two_frames_zero_validation_errors() {
+    run_rt_denoiser_test(DenoiserMode::Auto);
+}
+
+#[test]
+fn headless_rt_svgf_two_frames_zero_validation_errors() {
+    run_rt_denoiser_test(DenoiserMode::Svgf);
 }

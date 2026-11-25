@@ -1,8 +1,19 @@
 use ash::vk;
-use engine_rhi::gpu_allocator::MemoryLocation;
-use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, GpuImage, RhiDevice, sync};
+use engine_rhi::{GpuImage, RhiDevice};
 
-use crate::error::{Result, RtNrdError};
+use crate::error::Result;
+#[cfg(not(has_nrd))]
+use crate::error::RtNrdError;
+use crate::svgf::SvgfDenoiser;
+
+#[cfg(has_nrd)]
+use engine_rhi::gpu_allocator::MemoryLocation;
+#[cfg(has_nrd)]
+use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, sync};
+
+#[cfg(has_nrd)]
+use crate::error::RtNrdError;
+#[cfg(has_nrd)]
 use crate::ffi::{
     NRD_DENOISER_REBLUR_DIFFUSE_SPECULAR, NRD_DESCRIPTOR_STORAGE_TEXTURE,
     NRD_RES_IN_DIFF_CONFIDENCE, NRD_RES_IN_DIFF_RADIANCE_HITDIST, NRD_RES_IN_MV,
@@ -15,11 +26,26 @@ use crate::ffi::{
     nrd_shim_get_library_info, nrd_shim_set_common_settings, nrd_shim_set_reblur_settings,
 };
 
+#[cfg(has_nrd)]
 const MAX_DISPATCHES: usize = 48;
+#[cfg(has_nrd)]
 const MAX_RESOURCES_PER_FRAME: usize = 512;
 
-/// Input textures provided to NRD REBLUR_DIFFUSE_SPECULAR each frame.
-/// All must be in `vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL` before `NrdDenoiser::record`.
+/// Selects which spatiotemporal denoiser backend [`NrdDenoiser`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DenoiserMode {
+    /// Use NVIDIA NRD (REBLUR) when compiled with the NRD SDK (`cfg(has_nrd)`),
+    /// otherwise fall back to the built-in GPL-3.0 SVGF denoiser.
+    #[default]
+    Auto,
+    /// Require NVIDIA NRD (REBLUR); returns an error if the NRD SDK was not compiled in.
+    Nrd,
+    /// Force the built-in GPL-3.0 SVGF spatiotemporal denoiser.
+    Svgf,
+}
+
+/// Input textures provided to the denoiser each frame.
+/// All must be in `vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL` before [`NrdDenoiser::record`].
 pub struct NrdInputs<'a> {
     pub diff_rad_hitdist: &'a GpuImage,
     pub spec_rad_hitdist: &'a GpuImage,
@@ -30,6 +56,201 @@ pub struct NrdInputs<'a> {
     pub spec_confidence: &'a GpuImage,
 }
 
+enum DenoiserBackend {
+    #[cfg(has_nrd)]
+    Nrd(Box<NrdBackend>),
+    Svgf(Box<SvgfDenoiser>),
+}
+
+/// Unified spatiotemporal denoiser supporting optional NVIDIA NRD (`REBLUR_DIFFUSE_SPECULAR`)
+/// and a built-in pure GPL-3.0 SVGF fallback.
+pub struct NrdDenoiser {
+    pub extent: vk::Extent2D,
+    pub out_diff_rad_hitdist: GpuImage,
+    pub out_spec_rad_hitdist: GpuImage,
+    backend: DenoiserBackend,
+}
+
+impl NrdDenoiser {
+    /// Create a denoiser using [`DenoiserMode::Auto`] (NRD if available, else built-in SVGF).
+    pub fn new(rhi: &mut RhiDevice, width: u32, height: u32) -> Result<Self> {
+        Self::new_with_mode(rhi, width, height, DenoiserMode::Auto)
+    }
+
+    /// Create a denoiser with an explicitly requested [`DenoiserMode`].
+    pub fn new_with_mode(
+        rhi: &mut RhiDevice,
+        width: u32,
+        height: u32,
+        mode: DenoiserMode,
+    ) -> Result<Self> {
+        let device = rhi.device.clone();
+
+        let out_diff_rad_hitdist = GpuImage::create_2d(
+            &device,
+            rhi.allocator_mut(),
+            width,
+            height,
+            1,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            "nrd-out-diff-rad-hitdist",
+        )?;
+        let out_spec_rad_hitdist = GpuImage::create_2d(
+            &device,
+            rhi.allocator_mut(),
+            width,
+            height,
+            1,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            "nrd-out-spec-rad-hitdist",
+        )?;
+
+        let backend = match mode {
+            DenoiserMode::Auto => {
+                #[cfg(has_nrd)]
+                {
+                    DenoiserBackend::Nrd(Box::new(NrdBackend::new(rhi, width, height)?))
+                }
+                #[cfg(not(has_nrd))]
+                {
+                    DenoiserBackend::Svgf(Box::new(SvgfDenoiser::new(rhi, width, height)?))
+                }
+            }
+            DenoiserMode::Nrd => {
+                #[cfg(has_nrd)]
+                {
+                    DenoiserBackend::Nrd(Box::new(NrdBackend::new(rhi, width, height)?))
+                }
+                #[cfg(not(has_nrd))]
+                {
+                    let alloc = rhi.allocator_mut();
+                    let _ = out_diff_rad_hitdist.destroy(&device, alloc);
+                    let _ = out_spec_rad_hitdist.destroy(&device, alloc);
+                    return Err(RtNrdError::InvalidConfig(
+                        "DenoiserMode::Nrd requested, but crate was built without NVIDIA NRD SDK"
+                            .to_string(),
+                    ));
+                }
+            }
+            DenoiserMode::Svgf => {
+                DenoiserBackend::Svgf(Box::new(SvgfDenoiser::new(rhi, width, height)?))
+            }
+        };
+
+        Ok(Self {
+            extent: vk::Extent2D { width, height },
+            out_diff_rad_hitdist,
+            out_spec_rad_hitdist,
+            backend,
+        })
+    }
+
+    /// Returns `true` if this denoiser instance is backed by NVIDIA NRD (REBLUR).
+    #[inline]
+    pub fn is_using_nrd(&self) -> bool {
+        #[cfg(has_nrd)]
+        {
+            matches!(self.backend, DenoiserBackend::Nrd(_))
+        }
+        #[cfg(not(has_nrd))]
+        {
+            false
+        }
+    }
+
+    /// Human-readable name of the active denoiser backend.
+    #[inline]
+    pub fn backend_name(&self) -> &'static str {
+        if self.is_using_nrd() {
+            "NVIDIA NRD (REBLUR)"
+        } else {
+            "Built-in SVGF (GPL-3.0)"
+        }
+    }
+
+    /// Configure denoiser settings and record compute dispatches with `Synchronization2` barriers.
+    ///
+    /// Leaves `out_diff_rad_hitdist` and `out_spec_rad_hitdist` in `vk::ImageLayout::GENERAL`
+    /// ready for `NrdComposePass`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        inputs: &NrdInputs<'_>,
+        view_to_clip: [[f32; 4]; 4],
+        view_to_clip_prev: [[f32; 4]; 4],
+        world_to_view: [[f32; 4]; 4],
+        world_to_view_prev: [[f32; 4]; 4],
+        jitter: [f32; 2],
+        jitter_prev: [f32; 2],
+        denoising_range: f32,
+        time_delta_ms: f32,
+        reset_history: bool,
+        frame_slot: usize,
+    ) -> Result<()> {
+        match &mut self.backend {
+            #[cfg(has_nrd)]
+            DenoiserBackend::Nrd(nrd) => nrd.record(
+                device,
+                cmd,
+                inputs,
+                &self.out_diff_rad_hitdist,
+                &self.out_spec_rad_hitdist,
+                view_to_clip,
+                view_to_clip_prev,
+                world_to_view,
+                world_to_view_prev,
+                jitter,
+                jitter_prev,
+                denoising_range,
+                time_delta_ms,
+                reset_history,
+                frame_slot,
+            ),
+            DenoiserBackend::Svgf(svgf) => {
+                let _ = (
+                    view_to_clip,
+                    view_to_clip_prev,
+                    world_to_view,
+                    world_to_view_prev,
+                    jitter,
+                    jitter_prev,
+                    time_delta_ms,
+                );
+                svgf.record(
+                    device,
+                    cmd,
+                    inputs,
+                    &self.out_diff_rad_hitdist,
+                    &self.out_spec_rad_hitdist,
+                    denoising_range,
+                    reset_history,
+                    frame_slot,
+                )
+            }
+        }
+    }
+
+    pub fn destroy(self, rhi: &mut RhiDevice) -> Result<()> {
+        match self.backend {
+            #[cfg(has_nrd)]
+            DenoiserBackend::Nrd(nrd) => nrd.destroy(rhi)?,
+            DenoiserBackend::Svgf(svgf) => svgf.destroy(rhi)?,
+        }
+        let device = rhi.device.clone();
+        let alloc = rhi.allocator_mut();
+        self.out_diff_rad_hitdist.destroy(&device, alloc)?;
+        self.out_spec_rad_hitdist.destroy(&device, alloc)?;
+        Ok(())
+    }
+}
+
+#[cfg(has_nrd)]
 #[derive(Clone, Copy)]
 struct TrackedImageState {
     layout: vk::ImageLayout,
@@ -37,6 +258,7 @@ struct TrackedImageState {
     access: vk::AccessFlags2,
 }
 
+#[cfg(has_nrd)]
 impl Default for TrackedImageState {
     fn default() -> Self {
         Self {
@@ -48,13 +270,11 @@ impl Default for TrackedImageState {
 }
 
 /// Self-contained NVIDIA NRD (`REBLUR_DIFFUSE_SPECULAR`) compute pass graph.
-pub struct NrdDenoiser {
+#[cfg(has_nrd)]
+struct NrdBackend {
     instance: *mut NrdInstance,
-    pub lib_info: NrdLibraryInfo,
-    pub extent: vk::Extent2D,
+    extent: vk::Extent2D,
 
-    pub out_diff_rad_hitdist: GpuImage,
-    pub out_spec_rad_hitdist: GpuImage,
     perm_pool: Vec<GpuImage>,
     trans_pool: Vec<GpuImage>,
     perm_states: Vec<TrackedImageState>,
@@ -91,8 +311,9 @@ pub struct NrdDenoiser {
     frame_index: u32,
 }
 
-impl NrdDenoiser {
-    pub fn new(rhi: &mut RhiDevice, width: u32, height: u32) -> Result<Self> {
+#[cfg(has_nrd)]
+impl NrdBackend {
+    fn new(rhi: &mut RhiDevice, width: u32, height: u32) -> Result<Self> {
         let mut lib_info = NrdLibraryInfo::default();
         unsafe {
             nrd_shim_get_library_info(&mut lib_info);
@@ -200,29 +421,6 @@ impl NrdDenoiser {
                 &format!("nrd-trans-{i}"),
             )?);
         }
-
-        let out_diff_rad_hitdist = GpuImage::create_2d(
-            &device,
-            rhi.allocator_mut(),
-            width,
-            height,
-            1,
-            vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-            "nrd-out-diff-rad-hitdist",
-        )?;
-        let out_spec_rad_hitdist = GpuImage::create_2d(
-            &device,
-            rhi.allocator_mut(),
-            width,
-            height,
-            1,
-            vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-            "nrd-out-spec-rad-hitdist",
-        )?;
 
         let dummy_sampled = GpuImage::create_2d(
             &device,
@@ -472,10 +670,7 @@ impl NrdDenoiser {
 
         Ok(Self {
             instance,
-            lib_info,
             extent: vk::Extent2D { width, height },
-            out_diff_rad_hitdist,
-            out_spec_rad_hitdist,
             perm_pool,
             trans_pool,
             perm_states,
@@ -506,14 +701,14 @@ impl NrdDenoiser {
         })
     }
 
-    /// Configure NRD settings, update persistent constant buffers for `frame_slot`,
-    /// and record all NRD compute dispatches with fine-grained `Synchronization2` barriers.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(
+    fn record(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         inputs: &NrdInputs<'_>,
+        out_diff_rad_hitdist: &GpuImage,
+        out_spec_rad_hitdist: &GpuImage,
         view_to_clip: [[f32; 4]; 4],
         view_to_clip_prev: [[f32; 4]; 4],
         world_to_view: [[f32; 4]; 4],
@@ -680,23 +875,23 @@ impl NrdDenoiser {
                     NRD_RES_IN_SPEC_CONFIDENCE => inputs.spec_confidence.view,
                     NRD_RES_OUT_DIFF_RADIANCE_HITDIST => {
                         maybe_push_barrier(
-                            &self.out_diff_rad_hitdist,
+                            out_diff_rad_hitdist,
                             &mut self.out_diff_state,
                             req_layout,
                             req_access,
                             &mut barriers,
                         );
-                        self.out_diff_rad_hitdist.view
+                        out_diff_rad_hitdist.view
                     }
                     NRD_RES_OUT_SPEC_RADIANCE_HITDIST => {
                         maybe_push_barrier(
-                            &self.out_spec_rad_hitdist,
+                            out_spec_rad_hitdist,
                             &mut self.out_spec_state,
                             req_layout,
                             req_access,
                             &mut barriers,
                         );
-                        self.out_spec_rad_hitdist.view
+                        out_spec_rad_hitdist.view
                     }
                     NRD_RES_PERMANENT_POOL => {
                         let idx = rb.index_in_pool as usize;
@@ -804,14 +999,14 @@ impl NrdDenoiser {
         // Transition NRD outputs to GENERAL for nrd_compose.comp imageLoad
         let mut post_barriers = Vec::with_capacity(2);
         maybe_push_barrier(
-            &self.out_diff_rad_hitdist,
+            out_diff_rad_hitdist,
             &mut self.out_diff_state,
             vk::ImageLayout::GENERAL,
             vk::AccessFlags2::SHADER_STORAGE_READ,
             &mut post_barriers,
         );
         maybe_push_barrier(
-            &self.out_spec_rad_hitdist,
+            out_spec_rad_hitdist,
             &mut self.out_spec_state,
             vk::ImageLayout::GENERAL,
             vk::AccessFlags2::SHADER_STORAGE_READ,
@@ -827,7 +1022,7 @@ impl NrdDenoiser {
         Ok(())
     }
 
-    pub fn destroy(self, rhi: &mut RhiDevice) -> Result<()> {
+    fn destroy(self, rhi: &mut RhiDevice) -> Result<()> {
         let device = rhi.device.clone();
         unsafe {
             for p in self.pipelines {
@@ -857,14 +1052,13 @@ impl NrdDenoiser {
         for img in self.trans_pool {
             img.destroy(&device, alloc)?;
         }
-        self.out_diff_rad_hitdist.destroy(&device, alloc)?;
-        self.out_spec_rad_hitdist.destroy(&device, alloc)?;
         self.dummy_sampled.destroy(&device, alloc)?;
         self.dummy_storage.destroy(&device, alloc)?;
         Ok(())
     }
 }
 
+#[cfg(has_nrd)]
 fn maybe_push_barrier<'a>(
     image: &'a GpuImage,
     state: &mut TrackedImageState,
@@ -894,6 +1088,7 @@ fn maybe_push_barrier<'a>(
     state.access = req_access;
 }
 
+#[cfg(has_nrd)]
 fn flatten_mat4(m: [[f32; 4]; 4]) -> [f32; 16] {
     [
         m[0][0], m[0][1], m[0][2], m[0][3],
@@ -903,6 +1098,7 @@ fn flatten_mat4(m: [[f32; 4]; 4]) -> [f32; 16] {
     ]
 }
 
+#[cfg(has_nrd)]
 fn nrd_format_to_vk(fmt: u32) -> Result<vk::Format> {
     // Matches nrd::Format enum in NRDDescs.h
     let vk_fmt = match fmt {

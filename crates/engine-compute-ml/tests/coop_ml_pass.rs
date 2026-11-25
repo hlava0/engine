@@ -47,6 +47,7 @@ fn run_coop_ml_test(force_fallback: bool) -> (bool, Vec<[f32; 4]>) {
         app_name: "coop-ml-test".to_string(),
         enable_validation: true,
         enable_sync_validation: true,
+        ..Default::default()
     })
     .expect("RhiDevice init");
 

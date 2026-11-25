@@ -3,6 +3,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone, Copy)]
+enum ShaderCompiler {
+    GlslangValidator,
+    Glslc,
+}
+
+fn detect_shader_compiler() -> ShaderCompiler {
+    if Command::new("glslangValidator")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return ShaderCompiler::GlslangValidator;
+    }
+    if Command::new("glslc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        println!("cargo:warning=glslangValidator not found in PATH; falling back to glslc");
+        return ShaderCompiler::Glslc;
+    }
+    panic!(
+        "Neither `glslangValidator` nor `glslc` was found in PATH. Install the Vulkan SDK, glslang (`glslangValidator`), or shaderc (`glslc`) to compile GLSL shaders."
+    );
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let shader_dir = manifest_dir.join("../../shaders");
@@ -10,10 +37,13 @@ fn main() {
 
     fs::create_dir_all(&out_dir).expect("Failed to create OUT_DIR/shaders");
     println!("cargo:rerun-if-changed={}", shader_dir.display());
+    println!("cargo:rerun-if-env-changed=PATH");
+
+    let compiler = detect_shader_compiler();
 
     let mut compiled = Vec::new();
     if shader_dir.exists() {
-        compile_dir(&shader_dir, &shader_dir, &out_dir, &mut compiled);
+        compile_dir(compiler, &shader_dir, &shader_dir, &out_dir, &mut compiled);
     }
     compiled.sort();
 
@@ -28,12 +58,18 @@ fn main() {
     fs::write(out_dir.join("registry.rs"), registry).expect("Failed to write shader registry.rs");
 }
 
-fn compile_dir(root: &Path, dir: &Path, out_dir: &Path, compiled: &mut Vec<String>) {
+fn compile_dir(
+    compiler: ShaderCompiler,
+    root: &Path,
+    dir: &Path,
+    out_dir: &Path,
+    compiled: &mut Vec<String>,
+) {
     let entries = fs::read_dir(dir).expect("Failed to read shader directory");
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            compile_dir(root, &path, out_dir, compiled);
+            compile_dir(compiler, root, &path, out_dir, compiled);
             continue;
         }
 
@@ -58,19 +94,34 @@ fn compile_dir(root: &Path, dir: &Path, out_dir: &Path, compiled: &mut Vec<Strin
             fs::create_dir_all(parent).expect("Failed to create output shader parent dir");
         }
 
-        let status = Command::new("glslangValidator")
-            .arg("-V")
-            .arg("--target-env")
-            .arg("spirv1.6")
-            .arg("-g")
-            .arg("-o")
-            .arg(&out_file)
-            .arg(&path)
-            .status()
-            .expect("Failed to execute glslangValidator");
+        let status = match compiler {
+            ShaderCompiler::GlslangValidator => Command::new("glslangValidator")
+                .arg("-V")
+                .arg("--target-env")
+                .arg("spirv1.6")
+                .arg("-g")
+                .arg("-o")
+                .arg(&out_file)
+                .arg(&path)
+                .status()
+                .expect("Failed to execute glslangValidator"),
+            ShaderCompiler::Glslc => Command::new("glslc")
+                .arg("--target-env=vulkan1.3")
+                .arg("-g")
+                .arg("-O")
+                .arg("-o")
+                .arg(&out_file)
+                .arg(&path)
+                .status()
+                .expect("Failed to execute glslc"),
+        };
 
         if !status.success() {
-            panic!("glslangValidator failed for {}", path.display());
+            let tool = match compiler {
+                ShaderCompiler::GlslangValidator => "glslangValidator",
+                ShaderCompiler::Glslc => "glslc",
+            };
+            panic!("{tool} failed for {}", path.display());
         }
 
         let rel_str = rel.to_string_lossy().replace('\\', "/");

@@ -9,10 +9,13 @@ engine-rhi = { path = "../engine-rhi" }
 engine-gpu-driven = { path = "../engine-gpu-driven" }
 engine-rt-nrd = { path = "../engine-rt-nrd" }
 engine-compute-ml = { path = "../engine-compute-ml" }
+engine-assets = { path = "../engine-assets" }
+engine-gameplay = { path = "../engine-gameplay" }
 ash.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true
+winit.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

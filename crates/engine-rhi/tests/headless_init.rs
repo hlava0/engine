@@ -22,6 +22,7 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
         app_name: "headless-init-test".to_string(),
         enable_validation: true,
         enable_sync_validation: true,
+        ..Default::default()
     })
     .expect("Failed to initialize RhiDevice");
 

@@ -1,14 +1,17 @@
 //! Main GPU-driven Vulkan 1.4 + RT + NRD + CoopML engine loop with 2-frames-in-flight pipelining.
 
+use std::ffi::CStr;
 use std::time::Instant;
 
 use engine_compute_ml::CoopMlPipeline;
 use engine_gpu_driven::{GpuDrivenPipeline, GpuInstanceData, GpuScene};
 use engine_rhi::ash::vk;
+use engine_rhi::ash_window;
 use engine_rhi::gpu_allocator::MemoryLocation;
+use engine_rhi::raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use engine_rhi::{
     BindlessConfig, BindlessTable, CoopMatrixTile, FRAMES_IN_FLIGHT, GpuBuffer, GpuImage,
-    RhiConfig, RhiDevice, VendorProfile, sync,
+    RhiConfig, RhiDevice, Swapchain, VendorProfile, sync,
 };
 use engine_rt_nrd::{
     AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RtGiPass, RtParams,
@@ -41,9 +44,10 @@ struct FrameSlot {
     submitted: bool,
 }
 
-/// Top-level headless/render engine owning all Vulkan 1.4 subsystems.
+/// Top-level headless or windowed render engine owning all Vulkan 1.3/1.4 subsystems.
 pub struct Engine {
     rhi: RhiDevice,
+    swapchain: Option<Swapchain>,
     bindless: Option<BindlessTable>,
     gbuffer_pipe: Option<GpuDrivenPipeline>,
     gpu_scene: Option<GpuScene>,
@@ -63,19 +67,76 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Initialize all engine subsystems for the given `SceneWorld` and resolution.
+    /// Initialize all engine subsystems in headless mode for the given `SceneWorld` and resolution.
     pub fn new(
         world: SceneWorld,
         width: u32,
         height: u32,
         enable_validation: bool,
     ) -> Result<Self, EngineError> {
-        let mut rhi = RhiDevice::new(RhiConfig {
+        let rhi = RhiDevice::new(RhiConfig {
             app_name: "vulkan-gpu-driven-engine".to_string(),
             enable_validation,
             enable_sync_validation: enable_validation,
+            ..Default::default()
         })?;
 
+        Self::init_subsystems(rhi, None, world, width, height)
+    }
+
+    /// Initialize all engine subsystems with a windowed `VK_KHR_surface` + `VK_KHR_swapchain`.
+    pub fn new_with_window(
+        world: SceneWorld,
+        width: u32,
+        height: u32,
+        enable_validation: bool,
+        display_handle: RawDisplayHandle,
+        window_handle: RawWindowHandle,
+    ) -> Result<Self, EngineError> {
+        let raw_exts = ash_window::enumerate_required_extensions(display_handle)?;
+        let surface_extensions: Vec<&'static CStr> = raw_exts
+            .iter()
+            .map(|&ptr| unsafe { CStr::from_ptr(ptr) })
+            .collect();
+
+        let rhi = RhiDevice::new(RhiConfig {
+            app_name: "vulkan-gpu-driven-engine".to_string(),
+            enable_validation,
+            enable_sync_validation: enable_validation,
+            surface_extensions,
+            enable_swapchain: true,
+        })?;
+
+        let surface = unsafe {
+            ash_window::create_surface(
+                &rhi.entry,
+                &rhi.instance,
+                display_handle,
+                window_handle,
+                None,
+            )?
+        };
+
+        let swapchain = match Swapchain::new(&rhi, surface, width.max(1), height.max(1)) {
+            Ok(sc) => sc,
+            Err(err) => {
+                if let Some(loader) = rhi.surface_loader.as_ref() {
+                    unsafe { loader.destroy_surface(surface, None) };
+                }
+                return Err(err.into());
+            }
+        };
+
+        Self::init_subsystems(rhi, Some(swapchain), world, width.max(1), height.max(1))
+    }
+
+    fn init_subsystems(
+        mut rhi: RhiDevice,
+        swapchain: Option<Swapchain>,
+        world: SceneWorld,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, EngineError> {
         let bindless = BindlessTable::new(&rhi.device, BindlessConfig::default())?;
         let gbuffer_pipe = GpuDrivenPipeline::new(&mut rhi, &bindless, width, height)?;
 
@@ -157,6 +218,7 @@ impl Engine {
 
         Ok(Self {
             rhi,
+            swapchain,
             bindless: Some(bindless),
             gbuffer_pipe: Some(gbuffer_pipe),
             gpu_scene: Some(gpu_scene),
@@ -174,6 +236,26 @@ impl Engine {
             frame_index: 0,
             has_hiz_history: false,
         })
+    }
+
+    /// Recreate the window swapchain for a new `(width, height)`.
+    ///
+    /// Gracefully ignores 0-sized (minimized) windows.
+    pub fn resize_swapchain(&mut self, width: u32, height: u32) -> Result<(), EngineError> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if let Some(sc) = self.swapchain.as_mut() {
+            sc.recreate(&self.rhi, width, height)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the active denoiser backend name (`"NVIDIA NRD (REBLUR)"` or `"Built-in SVGF (GPL-3.0)"`).
+    pub fn denoiser_backend_name(&self) -> &'static str {
+        self.nrd
+            .as_ref()
+            .map_or("None", NrdDenoiser::backend_name)
     }
 
     /// Wait for all in-flight GPU work to finish.
@@ -211,7 +293,7 @@ impl Engine {
         self.rhi.validation_errors()
     }
 
-    /// Execute one full pipelined frame (Scene sync -> Accel -> Cull+GBuffer+HiZ -> RT GI -> NRD -> Compose -> CoopML).
+    /// Execute one full pipelined headless frame (Scene sync -> Accel -> Cull+GBuffer+HiZ -> RT GI -> Denoiser -> Compose -> CoopML).
     ///
     /// Uses 2-frames-in-flight async pipelining: waits only on frame `N - 2`'s fence, reads back
     /// its completed GPU timestamps & draw count without stalling, records frame `N`, and submits
@@ -221,7 +303,6 @@ impl Engine {
         let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
         let is_first = frame_idx == 0;
 
-        // 1. Wait only on this slot's fence (frame N - FRAMES_IN_FLIGHT) and reset pool
         let fence = self.frames[slot_idx].fence;
         let pool = self.frames[slot_idx].command_pool;
         let cmd = self.frames[slot_idx].cmd;
@@ -233,7 +314,236 @@ impl Engine {
                 .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
         }
 
-        // 2. Non-blocking readback of completed GPU timestamps & draw count from this slot
+        let (draw_count, gpu_timings, record_start) =
+            self.record_render_passes(cmd, dt, frame_idx, slot_idx, is_first)?;
+
+        unsafe { self.rhi.device.end_command_buffer(cmd)? };
+        let cpu_record_us = record_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let cmd_submit = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_submit)];
+        unsafe {
+            self.rhi
+                .device
+                .queue_submit2(self.rhi.graphics_queue, &submit_info, fence)?;
+        }
+
+        self.frames[slot_idx].submitted = true;
+        self.frame_index += 1;
+        self.has_hiz_history = true;
+
+        Ok(FrameStats {
+            frame_index: frame_idx,
+            cpu_record_us,
+            draw_count,
+            gpu_timings,
+        })
+    }
+
+    /// Execute one full pipelined frame and blit + present the post-processed output to the window swapchain.
+    ///
+    /// Returns `Ok((stats, needs_recreate))`, where `needs_recreate` is `true` if the swapchain
+    /// reported `SUBOPTIMAL_KHR` or `ERROR_OUT_OF_DATE_KHR` and should be resized via [`Engine::resize_swapchain`].
+    pub fn render_frame_to_swapchain(&mut self, dt: f32) -> Result<(FrameStats, bool), EngineError> {
+        let frame_idx = self.frame_index;
+        let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
+        let is_first = frame_idx == 0;
+
+        // 1. Wait on this slot's fence BEFORE acquiring so `image_available[slot_idx]` is idle
+        let fence = self.frames[slot_idx].fence;
+        let pool = self.frames[slot_idx].command_pool;
+        let cmd = self.frames[slot_idx].cmd;
+        unsafe {
+            self.rhi.device.wait_for_fences(&[fence], true, u64::MAX)?;
+        }
+
+        let Some(swapchain) = self.swapchain.as_ref() else {
+            let stats = self.render_frame(dt)?;
+            return Ok((stats, false));
+        };
+
+        let (image_index, mut needs_recreate) = match swapchain.acquire_next_image(slot_idx) {
+            Ok(pair) => pair,
+            Err(engine_rhi::RhiError::Vk(vk::Result::ERROR_OUT_OF_DATE_KHR)) => {
+                return Ok((
+                    FrameStats {
+                        frame_index: frame_idx,
+                        cpu_record_us: 0.0,
+                        draw_count: 0,
+                        gpu_timings: Vec::new(),
+                    },
+                    true,
+                ));
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let swapchain_image = swapchain.images[image_index as usize];
+        let swapchain_extent = swapchain.extent;
+        let image_available_sem = swapchain.image_available_semaphore(slot_idx);
+        let render_finished_sem = swapchain.render_finished_semaphore(image_index);
+
+        // Reset fence & command pool only after acquire succeeded
+        unsafe {
+            self.rhi.device.reset_fences(&[fence])?;
+            self.rhi
+                .device
+                .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())?;
+        }
+
+        let (draw_count, gpu_timings, record_start) =
+            self.record_render_passes(cmd, dt, frame_idx, slot_idx, is_first)?;
+
+        // Blit CoopML output_image (GENERAL) -> swapchain_image (TRANSFER_DST -> PRESENT_SRC_KHR)
+        let out_img = self.output_image.as_ref().expect("output_image");
+        let color_subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let pre_blit_barriers = [
+            sync::image_barrier(
+                out_img.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+                out_img.subresource_range(),
+            ),
+            sync::image_barrier(
+                swapchain_image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                color_subresource,
+            ),
+        ];
+        unsafe {
+            sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &pre_blit_barriers);
+        }
+
+        let blit_region = [vk::ImageBlit2::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: self.width as i32,
+                    y: self.height as i32,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: swapchain_extent.width as i32,
+                    y: swapchain_extent.height as i32,
+                    z: 1,
+                },
+            ])];
+        let blit_info = vk::BlitImageInfo2::default()
+            .src_image(out_img.image)
+            .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .dst_image(swapchain_image)
+            .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .regions(&blit_region)
+            .filter(vk::Filter::LINEAR);
+        unsafe {
+            self.rhi.device.cmd_blit_image2(cmd, &blit_info);
+        }
+
+        let post_blit_barriers = [
+            sync::image_barrier(
+                swapchain_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                vk::AccessFlags2::NONE,
+                color_subresource,
+            ),
+            sync::image_barrier(
+                out_img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                out_img.subresource_range(),
+            ),
+        ];
+        unsafe {
+            sync::cmd_pipeline_barrier2(&self.rhi.device, cmd, &[], &[], &post_blit_barriers);
+            self.rhi.device.end_command_buffer(cmd)?;
+        }
+        let cpu_record_us = record_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let wait_sem_infos = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(image_available_sem)
+            .stage_mask(vk::PipelineStageFlags2::TRANSFER)];
+        let signal_sem_infos = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(render_finished_sem)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let cmd_submit = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit_info = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&wait_sem_infos)
+            .command_buffer_infos(&cmd_submit)
+            .signal_semaphore_infos(&signal_sem_infos)];
+        unsafe {
+            self.rhi
+                .device
+                .queue_submit2(self.rhi.graphics_queue, &submit_info, fence)?;
+        }
+
+        if let Some(sc) = self.swapchain.as_ref()
+            && sc.present(self.rhi.graphics_queue, image_index)?
+        {
+            needs_recreate = true;
+        }
+
+        self.frames[slot_idx].submitted = true;
+        self.frame_index += 1;
+        self.has_hiz_history = true;
+
+        Ok((
+            FrameStats {
+                frame_index: frame_idx,
+                cpu_record_us,
+                draw_count,
+                gpu_timings,
+            },
+            needs_recreate,
+        ))
+    }
+
+    fn record_render_passes(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        dt: f32,
+        frame_idx: u32,
+        slot_idx: usize,
+        is_first: bool,
+    ) -> Result<(u32, Vec<PassTiming>, Instant), EngineError> {
+        // Non-blocking readback of completed GPU timestamps & draw count from this slot
         let gpu_scene = self.gpu_scene.as_mut().expect("gpu_scene");
         let (draw_count, gpu_timings) = if self.frames[slot_idx].submitted {
             let timings = self.frames[slot_idx].profiler.readback(&self.rhi.device)?;
@@ -243,7 +553,7 @@ impl Engine {
             (0, Vec::new())
         };
 
-        // 3. Step simulation and fill pre-allocated scratch buffer (zero heap allocation)
+        // Step simulation and fill pre-allocated scratch buffer (zero heap allocation)
         self.world.step(dt);
         let any_transform_dirty = self.world.dirty_instances;
         if any_transform_dirty {
@@ -330,7 +640,7 @@ impl Engine {
         rt_pass.record(&self.rhi.device, cmd, &gbuffer_pipe.targets, &rt_params, slot_idx)?;
         profiler.end_pass(&self.rhi.device, cmd, p_rt);
 
-        // 4. NVIDIA NRD Denoiser
+        // 4. Spatiotemporal Denoiser (NVIDIA NRD or Built-in SVGF)
         let nrd = self.nrd.as_mut().expect("nrd");
         let nrd_inputs = NrdInputs {
             diff_rad_hitdist: &rt_pass.nrd_diff_rad_hitdist,
@@ -359,7 +669,7 @@ impl Engine {
         )?;
         profiler.end_pass(&self.rhi.device, cmd, p_nrd);
 
-        // 5. NRD Remodulation & Sky Composition
+        // 5. Remodulation & Sky Composition
         let compose = self.compose.as_mut().expect("compose");
         let p_comp = profiler.begin_pass(&self.rhi.device, cmd, "Compose");
         compose.record(&self.rhi.device, cmd, rt_pass, slot_idx);
@@ -380,28 +690,7 @@ impl Engine {
         );
         profiler.end_pass(&self.rhi.device, cmd, p_ml);
 
-        unsafe { self.rhi.device.end_command_buffer(cmd)? };
-        let cpu_record_us = record_start.elapsed().as_secs_f64() * 1_000_000.0;
-
-        // 4. Submit asynchronously via vkQueueSubmit2 signaling this slot's fence
-        let cmd_submit = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-        let submit_info = [vk::SubmitInfo2::default().command_buffer_infos(&cmd_submit)];
-        unsafe {
-            self.rhi
-                .device
-                .queue_submit2(self.rhi.graphics_queue, &submit_info, fence)?;
-        }
-
-        self.frames[slot_idx].submitted = true;
-        self.frame_index += 1;
-        self.has_hiz_history = true;
-
-        Ok(FrameStats {
-            frame_index: frame_idx,
-            cpu_record_us,
-            draw_count,
-            gpu_timings,
-        })
+        Ok((draw_count, gpu_timings, record_start))
     }
 
     /// Read back the final post-processed `output_image` as `[r, g, b, a]` `f32` pixels.
@@ -541,6 +830,9 @@ impl Drop for Engine {
         }
         if let Some(b) = self.bindless.take() {
             b.destroy(&dev);
+        }
+        if let Some(sc) = self.swapchain.take() {
+            sc.destroy(&self.rhi);
         }
     }
 }

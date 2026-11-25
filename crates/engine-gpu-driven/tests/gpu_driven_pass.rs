@@ -61,6 +61,7 @@ fn headless_gpu_driven_frustum_and_hiz_cull() {
         app_name: "gpu-driven-pass-test".to_string(),
         enable_validation: true,
         enable_sync_validation: true,
+        ..Default::default()
     })
     .expect("Failed to initialize RhiDevice");
 

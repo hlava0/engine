@@ -11,6 +11,9 @@ use crate::error::{Result, RhiError};
 use crate::pipeline_cache::PipelineCache;
 use crate::vendor::{VendorProbeInput, VendorProfile, detect_rebar};
 
+/// Vulkan 1.3 API version constant (`vk::make_api_version(0, 1, 3, 0)`).
+pub const API_VERSION_1_3: u32 = vk::make_api_version(0, 1, 3, 0);
+
 /// Vulkan 1.4 API version constant (`vk::make_api_version(0, 1, 4, 0)`).
 pub const API_VERSION_1_4: u32 = vk::make_api_version(0, 1, 4, 0);
 
@@ -20,6 +23,8 @@ pub struct RhiConfig {
     pub app_name: String,
     pub enable_validation: bool,
     pub enable_sync_validation: bool,
+    pub surface_extensions: Vec<&'static CStr>,
+    pub enable_swapchain: bool,
 }
 
 impl Default for RhiConfig {
@@ -28,6 +33,8 @@ impl Default for RhiConfig {
             app_name: "vulkan-gpu-driven-engine".to_string(),
             enable_validation: cfg!(debug_assertions),
             enable_sync_validation: cfg!(debug_assertions),
+            surface_extensions: Vec::new(),
+            enable_swapchain: false,
         }
     }
 }
@@ -95,6 +102,9 @@ pub struct DeviceCapabilities {
     // Compute shader derivatives (required by NRD SPIR-V)
     pub khr_compute_shader_derivatives: bool,
 
+    // Presentation / swapchain support
+    pub khr_swapchain: bool,
+
     // Vendor-specific hardware optimization profile
     pub vendor_profile: VendorProfile,
 }
@@ -129,6 +139,8 @@ pub struct RhiDevice {
     pub acceleration_structure: Option<ash::khr::acceleration_structure::Device>,
     pub ray_tracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub cooperative_matrix: Option<ash::khr::cooperative_matrix::Instance>,
+    pub swapchain_loader: Option<ash::khr::swapchain::Device>,
+    pub surface_loader: Option<ash::khr::surface::Instance>,
     pub pipeline_cache: vk::PipelineCache,
 
     pipeline_cache_owner: PipelineCache,
@@ -140,9 +152,32 @@ pub struct RhiDevice {
 }
 
 impl RhiDevice {
-    /// Initialize Vulkan 1.4 instance, select best physical device, probe capabilities, and create logical device + allocator.
+    /// Initialize Vulkan 1.4 (falling back gracefully to Vulkan 1.3), select best physical device,
+    /// probe capabilities, and create logical device + allocator.
     pub fn new(config: RhiConfig) -> Result<Self> {
         let entry = unsafe { ash::Entry::load()? };
+
+        let instance_version = unsafe { entry.try_enumerate_instance_version()? }
+            .unwrap_or(vk::API_VERSION_1_0);
+        if instance_version < API_VERSION_1_3 {
+            return Err(RhiError::MissingCapability(format!(
+                "Vulkan 1.3 or newer is required (loader reports {}.{}.{})",
+                vk::api_version_major(instance_version),
+                vk::api_version_minor(instance_version),
+                vk::api_version_patch(instance_version),
+            )));
+        }
+        let requested_api_version = if instance_version >= API_VERSION_1_4 {
+            API_VERSION_1_4
+        } else {
+            log::info!(
+                "Vulkan 1.4 not advertised by loader ({}.{}.{}); falling back to Vulkan 1.3",
+                vk::api_version_major(instance_version),
+                vk::api_version_minor(instance_version),
+                vk::api_version_patch(instance_version),
+            );
+            API_VERSION_1_3
+        };
 
         let validation_counters = Arc::new(ValidationCounters::default());
         let validation_user_data = Box::into_raw(Box::new(Arc::clone(&validation_counters)));
@@ -155,7 +190,7 @@ impl RhiDevice {
             .application_version(vk::make_api_version(0, 0, 1, 0))
             .engine_name(&engine_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
-            .api_version(API_VERSION_1_4);
+            .api_version(requested_api_version);
 
         let available_layers = unsafe { entry.enumerate_instance_layer_properties()? };
         let available_exts = unsafe { entry.enumerate_instance_extension_properties(None)? };
@@ -181,6 +216,15 @@ impl RhiDevice {
 
         let mut layer_names: Vec<*const i8> = Vec::new();
         let mut ext_names: Vec<*const i8> = Vec::new();
+
+        for &surf_ext in &config.surface_extensions {
+            if !ext_names
+                .iter()
+                .any(|&p| unsafe { CStr::from_ptr(p) } == surf_ext)
+            {
+                ext_names.push(surf_ext.as_ptr());
+            }
+        }
 
         if use_validation {
             layer_names.push(validation_layer_name.as_ptr());
@@ -236,10 +280,15 @@ impl RhiDevice {
         };
 
         let (physical_device, capabilities, queue_families) =
-            select_physical_device(&entry, &instance)?;
+            select_physical_device(&entry, &instance, config.enable_swapchain)?;
 
-        let (device, graphics_queue, compute_queue, transfer_queue) =
-            create_logical_device(&instance, physical_device, &capabilities, queue_families)?;
+        let (device, graphics_queue, compute_queue, transfer_queue) = create_logical_device(
+            &instance,
+            physical_device,
+            &capabilities,
+            queue_families,
+            config.enable_swapchain,
+        )?;
 
         let acceleration_structure = if capabilities.khr_acceleration_structure {
             Some(ash::khr::acceleration_structure::Device::new(
@@ -261,6 +310,18 @@ impl RhiDevice {
             Some(ash::khr::cooperative_matrix::Instance::new(
                 &entry, &instance,
             ))
+        } else {
+            None
+        };
+
+        let surface_loader = if config.enable_swapchain || !config.surface_extensions.is_empty() {
+            Some(ash::khr::surface::Instance::new(&entry, &instance))
+        } else {
+            None
+        };
+
+        let swapchain_loader = if config.enable_swapchain {
+            Some(ash::khr::swapchain::Device::new(&instance, &device))
         } else {
             None
         };
@@ -291,6 +352,8 @@ impl RhiDevice {
             acceleration_structure,
             ray_tracing_pipeline,
             cooperative_matrix,
+            swapchain_loader,
+            surface_loader,
             pipeline_cache,
             pipeline_cache_owner,
             allocator: ManuallyDrop::new(allocator),
@@ -438,6 +501,7 @@ impl Drop for RhiDevice {
 fn select_physical_device(
     entry: &ash::Entry,
     instance: &ash::Instance,
+    require_swapchain: bool,
 ) -> Result<(vk::PhysicalDevice, DeviceCapabilities, QueueFamilyIndices)> {
     let devices = unsafe { instance.enumerate_physical_devices()? };
     if devices.is_empty() {
@@ -452,12 +516,13 @@ fn select_physical_device(
         };
         let caps = probe_capabilities(entry, instance, pdev);
 
-        // Require Vulkan 1.4, BDA, Dynamic Rendering, Synchronization2, DrawIndirectCount
-        if caps.api_version < API_VERSION_1_4
+        // Require at least Vulkan 1.3, BDA, Dynamic Rendering, Synchronization2, DrawIndirectCount
+        if caps.api_version < API_VERSION_1_3
             || !caps.buffer_device_address
             || !caps.dynamic_rendering
             || !caps.synchronization2
             || !caps.draw_indirect_count
+            || (require_swapchain && !caps.khr_swapchain)
         {
             continue;
         }
@@ -468,6 +533,9 @@ fn select_physical_device(
             vk::PhysicalDeviceType::VIRTUAL_GPU => 100,
             _ => 10,
         };
+        if caps.api_version >= API_VERSION_1_4 {
+            score += 50;
+        }
         if caps.khr_ray_tracing_pipeline {
             score += 500;
         }
@@ -557,6 +625,7 @@ fn probe_capabilities(
     let khr_ray_tracing_position_fetch = has_ext(ash::khr::ray_tracing_position_fetch::NAME);
     let khr_cooperative_matrix = has_ext(ash::khr::cooperative_matrix::NAME);
     let khr_compute_shader_derivatives = has_ext(c"VK_KHR_compute_shader_derivatives");
+    let khr_swapchain = has_ext(ash::khr::swapchain::NAME);
     let ext_descriptor_buffer = has_ext(ash::ext::descriptor_buffer::NAME);
     let nv_ray_tracing_invocation_reorder = has_ext(c"VK_NV_ray_tracing_invocation_reorder");
 
@@ -705,6 +774,7 @@ fn probe_capabilities(
         max_compute_workgroup_subgroups: subgroup_size_props.max_compute_workgroup_subgroups,
         khr_compute_shader_derivatives: khr_compute_shader_derivatives
             && csd_feat.compute_derivative_group_quads != 0,
+        khr_swapchain,
         vendor_profile,
     }
 }
@@ -714,6 +784,7 @@ fn create_logical_device(
     pdev: vk::PhysicalDevice,
     caps: &DeviceCapabilities,
     queues: QueueFamilyIndices,
+    enable_swapchain: bool,
 ) -> Result<(ash::Device, vk::Queue, vk::Queue, vk::Queue)> {
     let mut unique_families = vec![queues.graphics];
     if !unique_families.contains(&queues.compute) {
@@ -734,6 +805,9 @@ fn create_logical_device(
         .collect();
 
     let mut enabled_exts: Vec<*const i8> = Vec::new();
+    if enable_swapchain {
+        enabled_exts.push(ash::khr::swapchain::NAME.as_ptr());
+    }
     if caps.khr_acceleration_structure {
         enabled_exts.push(ash::khr::acceleration_structure::NAME.as_ptr());
     }

@@ -2,6 +2,8 @@
 
 use std::f32::consts::PI;
 
+use engine_assets::LoadedScene;
+use engine_gameplay::{GameWorld, MeshRenderer, Transform};
 use engine_gpu_driven::types::{
     extract_frustum_planes_reverse_z, halton, mat4_identity, mat4_look_at_rh, mat4_mul,
     mat4_perspective_reverse_z, mat4_translation_scale,
@@ -147,6 +149,145 @@ pub struct SceneWorld {
 }
 
 impl SceneWorld {
+    /// Construct a [`SceneWorld`] from a glTF 2.0 [`LoadedScene`], automatically framing
+    /// the camera and adding default three-point lighting.
+    pub fn from_loaded_scene(loaded: LoadedScene, width: u32, height: u32) -> Self {
+        let meshes: Vec<MeshDesc> = loaded
+            .meshes
+            .into_iter()
+            .map(|m| MeshDesc {
+                vertices: m.vertices,
+                indices: m.indices,
+                bounding_sphere: m.bounding_sphere,
+            })
+            .collect();
+
+        let mut materials: Vec<MaterialDesc> = loaded
+            .materials
+            .into_iter()
+            .map(|m| MaterialDesc {
+                albedo: m.albedo,
+                roughness: m.roughness,
+                metallic: m.metallic,
+                emission: m.emissive,
+            })
+            .collect();
+        if materials.is_empty() {
+            materials.push(MaterialDesc {
+                albedo: [0.8, 0.8, 0.8],
+                roughness: 0.5,
+                metallic: 0.0,
+                emission: [0.0; 3],
+            });
+        }
+
+        let mut instances = Vec::with_capacity(loaded.instances.len());
+        let mut scene_center = [0.0f32; 3];
+        let mut max_extent = 1.0f32;
+
+        for inst in loaded.instances {
+            let mesh_id = inst.mesh_index as u32;
+            let material_id = (inst.material_index.min(materials.len() - 1)) as u32;
+            let bs = meshes
+                .get(inst.mesh_index)
+                .map(|m| m.bounding_sphere)
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let t = inst.transform;
+            let sx = (t[0][0] * t[0][0] + t[0][1] * t[0][1] + t[0][2] * t[0][2]).sqrt();
+            let sy = (t[1][0] * t[1][0] + t[1][1] * t[1][1] + t[1][2] * t[1][2]).sqrt();
+            let sz = (t[2][0] * t[2][0] + t[2][1] * t[2][1] + t[2][2] * t[2][2]).sqrt();
+            let max_s = sx.max(sy).max(sz).max(1e-3);
+            let pos = [t[3][0], t[3][1], t[3][2]];
+            for c in 0..3 {
+                scene_center[c] += pos[c];
+            }
+            max_extent = max_extent.max(bs[3] * max_s + (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt());
+
+            instances.push(InstanceDesc {
+                transform: t,
+                prev_transform: t,
+                bounding_sphere: [bs[0], bs[1], bs[2], bs[3] * max_s],
+                mesh_id,
+                material_id,
+                animated: false,
+                base_pos: pos,
+                base_scale: [sx, sy, sz],
+            });
+        }
+
+        if !instances.is_empty() {
+            let inv_n = 1.0 / instances.len() as f32;
+            for c in &mut scene_center {
+                *c *= inv_n;
+            }
+        }
+
+        let cam_dist = (max_extent * 1.8).clamp(3.0, 40.0);
+        let camera = CameraState::new(
+            [
+                scene_center[0],
+                scene_center[1] + cam_dist * 0.35,
+                scene_center[2] + cam_dist,
+            ],
+            scene_center,
+            60.0,
+            width,
+            height,
+        );
+
+        let lights = vec![
+            LightDesc {
+                pos: [0.0, 0.0, 0.0],
+                energy: 4.5,
+                dir: [-0.45, -0.82, -0.35],
+                is_point: false,
+                color: [1.0, 0.96, 0.88],
+                range: 1000.0,
+            },
+            LightDesc {
+                pos: [scene_center[0] - 3.0, scene_center[1] + 4.0, scene_center[2] + 3.0],
+                energy: 8.0,
+                dir: [0.0, -1.0, 0.0],
+                is_point: true,
+                color: [0.85, 0.92, 1.0],
+                range: 30.0,
+            },
+        ];
+
+        Self {
+            meshes,
+            materials,
+            instances,
+            lights,
+            camera,
+            time: 0.0,
+            dirty_instances: false,
+        }
+    }
+
+    /// Synchronize entity [`Transform`]s from an [`engine_gameplay::GameWorld`] into matching
+    /// [`SceneWorld::instances`], preserving previous-frame transforms for motion vectors.
+    pub fn sync_from_game_world(&mut self, game: &GameWorld) {
+        let mut any_changed = false;
+        for (_entity, (transform, renderer)) in
+            game.world.query::<(&Transform, &MeshRenderer)>().iter()
+        {
+            if let Some(idx) = renderer.instance_index
+                && let Some(inst) = self.instances.get_mut(idx)
+            {
+                let next = transform.to_matrix();
+                if inst.transform != next {
+                    inst.prev_transform = inst.transform;
+                    inst.transform = next;
+                    any_changed = true;
+                }
+            }
+        }
+        if any_changed {
+            self.dirty_instances = true;
+        }
+    }
+
     /// Advance animated instances and mark GPU instance buffer dirty if changed.
     pub fn step(&mut self, dt: f32) {
         self.time += dt;

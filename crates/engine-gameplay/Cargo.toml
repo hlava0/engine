@@ -1,0 +1,12 @@
+[package]
+name = "engine-gameplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hecs.workspace = true
+rhai.workspace = true
+rodio.workspace = true
+thiserror.workspace = true
+log.workspace = true
