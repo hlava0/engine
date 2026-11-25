@@ -15,7 +15,7 @@ Lean, modular, code-first 3D rendering engine in **Rust** targeting **Vulkan 1.4
 
 - **Rust**: `rustc` and `cargo` (Edition 2024)
 - **Vulkan 1.4 SDK**: Vulkan loader, validation layers (`VK_LAYER_KHRONOS_validation`), and `glslangValidator` in `PATH`
-- **NVIDIA NRD**: User-supplied local installation of the [NVIDIA Real-Time Denoisers (NRD) SDK](https://github.com/NVIDIA-RTX/NRD) (not bundled in this repository; governed by the NVIDIA RTX SDKs License). Build NRD with SPIR-V enabled and set `NRD_SDK_DIR` to the directory containing `Include/` and `lib/` (`libNRD.a`, `libShaderMakeBlob.a`).
+- **NVIDIA NRD**: User-supplied local installation of the [NVIDIA Real-Time Denoisers (NRD) SDK](https://github.com/NVIDIA-RTX/NRD) (not bundled in this repository; governed by the NVIDIA RTX SDKs License). You can either build it manually with SPIR-V enabled or run the opt-in helper `./scripts/fetch_nrd.sh --accept-nvidia-license`, then set `NRD_SDK_DIR` to the directory containing `Include/` and `lib/` (`libNRD.a`, `libShaderMakeBlob.a`).
 
 ## Verification
 

@@ -7,3 +7,5 @@ pipeline_cache_*.bin
 *.swp
 *.swo
 *~
+
+.nrd-sdk/
