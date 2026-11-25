@@ -4,7 +4,8 @@ use engine_rhi::gpu_allocator::MemoryLocation;
 use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, Result, RhiDevice, sync};
 
 use crate::types::{
-    DrawIndexedIndirectCommand, FrameUniforms, GpuInstanceData, GpuMeshDrawInfo, GpuVertex,
+    DrawIndexedIndirectCommand, FrameUniforms, GpuInstanceData, GpuMaterialTextures,
+    GpuMeshDrawInfo, GpuVertex,
 };
 
 /// GPU-resident scene buffers with Buffer Device Addresses (BDA) for GPU-driven culling & drawing.
@@ -17,6 +18,8 @@ pub struct GpuScene {
     pub draw_count_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub draw_instance_ids_buffer: GpuBuffer,
     pub frame_uniforms_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
+    pub material_textures_buffer: Option<GpuBuffer>,
+    pub default_sampler_idx: u32,
     pub instance_count: u32,
 }
 
@@ -136,6 +139,8 @@ impl GpuScene {
             draw_count_buffers,
             draw_instance_ids_buffer,
             frame_uniforms_buffers,
+            material_textures_buffer: None,
+            default_sampler_idx: 0,
             instance_count,
         })
     }
@@ -173,10 +178,50 @@ impl GpuScene {
         Ok(*bytemuck::from_bytes::<u32>(&mapped[..4]))
     }
 
+    /// Upload per-material bindless texture indices for `gbuffer.frag`.
+    pub fn set_material_textures(
+        &mut self,
+        rhi: &mut RhiDevice,
+        materials: &[GpuMaterialTextures],
+        default_sampler_idx: u32,
+    ) -> Result<()> {
+        let device = rhi.device.clone();
+        if let Some(old) = self.material_textures_buffer.take() {
+            old.destroy(&device, rhi.allocator_mut())?;
+        }
+        self.default_sampler_idx = default_sampler_idx;
+        if materials.is_empty() {
+            return Ok(());
+        }
+        let bytes = cast_slice(materials);
+        let mut buf = GpuBuffer::new(
+            &device,
+            rhi.allocator_mut(),
+            "gbuffer_material_textures",
+            bytes.len() as vk::DeviceSize,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::CpuToGpu,
+        )?;
+        buf.mapped_slice_mut()?[..bytes.len()].copy_from_slice(bytes);
+        self.material_textures_buffer = Some(buf);
+        Ok(())
+    }
+
+    /// Return the BDA address of `material_textures_buffer` (or `0` if none).
+    #[inline]
+    pub fn material_textures_address(&self) -> u64 {
+        self.material_textures_buffer
+            .as_ref()
+            .map_or(0, |b| b.device_address)
+    }
+
     /// Destroy all GPU buffers owned by this scene.
     pub fn destroy(self, rhi: &mut RhiDevice) -> Result<()> {
         let device = rhi.device.clone();
         let alloc = rhi.allocator_mut();
+        if let Some(mat_buf) = self.material_textures_buffer {
+            mat_buf.destroy(&device, alloc)?;
+        }
         self.vertex_buffer.destroy(&device, alloc)?;
         self.index_buffer.destroy(&device, alloc)?;
         self.instance_buffer.destroy(&device, alloc)?;

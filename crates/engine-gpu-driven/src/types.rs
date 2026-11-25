@@ -88,7 +88,29 @@ pub struct HizDownsamplePushConstants {
     pub is_first_mip: u32,
 }
 
-/// Push constants for `shaders/gbuffer.vert`.
+/// Per-material bindless texture indices pulled via BDA in `gbuffer.frag`.
+/// `u32::MAX` (`0xFFFFFFFF`) means "no texture bound; use scalar fallback".
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GpuMaterialTextures {
+    pub albedo_tex: u32,
+    pub normal_tex: u32,
+    pub metallic_roughness_tex: u32,
+    pub emissive_tex: u32,
+}
+
+impl Default for GpuMaterialTextures {
+    fn default() -> Self {
+        Self {
+            albedo_tex: u32::MAX,
+            normal_tex: u32::MAX,
+            metallic_roughness_tex: u32::MAX,
+            emissive_tex: u32::MAX,
+        }
+    }
+}
+
+/// Push constants for `shaders/gbuffer.vert` and `shaders/gbuffer.frag`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GeomPushConstants {
@@ -96,6 +118,9 @@ pub struct GeomPushConstants {
     pub vertices_ptr: u64,
     pub instances_ptr: u64,
     pub draw_instance_ids_ptr: u64,
+    pub material_textures_ptr: u64,
+    pub default_sampler_idx: u32,
+    pub _pad: u32,
 }
 
 /// Cull flag bits for `CullPushConstants::cull_flags`.
@@ -277,6 +302,7 @@ mod tests {
         assert_eq!(size_of::<CullPushConstants>(), 64);
         assert_eq!(align_of::<CullPushConstants>(), 8);
         assert_eq!(size_of::<HizDownsamplePushConstants>(), 24);
-        assert_eq!(size_of::<GeomPushConstants>(), 32);
+        assert_eq!(size_of::<GeomPushConstants>(), 48);
+        assert_eq!(size_of::<GpuMaterialTextures>(), 16);
     }
 }

@@ -41,11 +41,25 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Dra
     uint ids[];
 };
 
+struct GpuMaterialTextures {
+    uint albedo_tex;
+    uint normal_tex;
+    uint metallic_roughness_tex;
+    uint emissive_tex;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialTexturesBuf {
+    GpuMaterialTextures mats[];
+};
+
 layout(push_constant, scalar) uniform PushConstants {
     FrameUniformsBuf frame_uniforms;
     VertexBuf vertices;
     InstanceBuf instances;
     DrawInstanceIdBuf draw_instance_ids;
+    MaterialTexturesBuf material_textures;
+    uint default_sampler_idx;
+    uint _pad;
 } pc;
 
 layout(location = 0) out vec4 out_cur_clip_unjittered;
@@ -56,6 +70,7 @@ layout(location = 4) out vec4 out_albedo_metallic;
 layout(location = 5) out float out_roughness;
 layout(location = 6) out float out_view_z;
 layout(location = 7) flat out uint out_material_id;
+layout(location = 8) out vec3 out_world_pos;
 
 void main() {
     uint instance_id = pc.draw_instance_ids.ids[gl_InstanceIndex];
@@ -80,4 +95,5 @@ void main() {
     out_roughness = inst.roughness;
     out_view_z = -(pc.frame_uniforms.view * world_pos).z;
     out_material_id = inst.material_id;
+    out_world_pos = world_pos.xyz;
 }

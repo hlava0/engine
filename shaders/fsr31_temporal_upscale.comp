@@ -1,0 +1,122 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D in_color;
+layout(set = 0, binding = 1) uniform sampler2D in_motion;
+layout(set = 0, binding = 2) uniform sampler2D in_depth;
+layout(set = 0, binding = 3) uniform sampler2D in_history;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D out_upscaled;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D out_history;
+
+layout(push_constant, scalar) uniform PushConstants {
+    uvec2 render_size;
+    uvec2 display_size;
+    vec2 jitter;
+    float sharpness;
+    uint reset_history;
+} pc;
+
+vec3 rgb_to_ycocg(vec3 c) {
+    return vec3(
+         0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+         0.50 * c.r             - 0.50 * c.b,
+        -0.25 * c.r + 0.5 * c.g - 0.25 * c.b
+    );
+}
+
+vec3 ycocg_to_rgb(vec3 c) {
+    return vec3(
+        c.x + c.y - c.z,
+        c.x + c.z,
+        c.x - c.y - c.z
+    );
+}
+
+// 5-tap Catmull-Rom history filter (eliminates bilinear blur during motion)
+vec3 sample_history_catmull_rom(vec2 uv, vec2 tex_size) {
+    vec2 pos = uv * tex_size;
+    vec2 center = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - center;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+
+    vec2 w0 = f2 - 0.5 * (f3 + f);
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w3 = 0.5 * (f3 - f2);
+    vec2 w2 = 1.0 - w0 - w1 - w3;
+
+    vec2 w12 = w1 + w2;
+    vec2 tc12 = (center + w2 / max(w12, vec2(1e-5))) / tex_size;
+    vec2 tc0 = (center - 1.0) / tex_size;
+    vec2 tc3 = (center + 2.0) / tex_size;
+
+    vec3 res = vec3(0.0);
+    res += textureLod(in_history, vec2(tc12.x, tc0.y), 0.0).rgb * (w12.x * w0.y);
+    res += textureLod(in_history, vec2(tc0.x, tc12.y), 0.0).rgb * (w0.x * w12.y);
+    res += textureLod(in_history, vec2(tc12.x, tc12.y), 0.0).rgb * (w12.x * w12.y);
+    res += textureLod(in_history, vec2(tc3.x, tc12.y), 0.0).rgb * (w3.x * w12.y);
+    res += textureLod(in_history, vec2(tc12.x, tc3.y), 0.0).rgb * (w12.x * w3.y);
+    float norm = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
+    return max(res / max(norm, 1e-5), vec3(0.0));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.display_size.x) || px.y >= int(pc.display_size.y)) {
+        return;
+    }
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(pc.display_size);
+    vec2 unjittered_uv = uv - pc.jitter * 0.5;
+    vec3 cur = textureLod(in_color, unjittered_uv, 0.0).rgb;
+
+    // 3x3 neighborhood YCoCg variance box for FSR 3.1-style anti-ghosting
+    vec2 r_inv = 1.0 / vec2(pc.render_size);
+    vec3 m1 = vec3(0.0);
+    vec3 m2 = vec3(0.0);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec3 s = rgb_to_ycocg(textureLod(in_color, unjittered_uv + vec2(dx, dy) * r_inv, 0.0).rgb);
+            m1 += s;
+            m2 += s * s;
+        }
+    }
+    vec3 mean = m1 / 9.0;
+    vec3 stddev = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+    vec3 box_min = mean - 1.25 * stddev;
+    vec3 box_max = mean + 1.25 * stddev;
+
+    vec2 mv = textureLod(in_motion, uv, 0.0).rg;
+    vec2 prev_uv = uv + mv;
+    bool valid_hist = pc.reset_history == 0u
+        && all(greaterThanEqual(prev_uv, vec2(0.0)))
+        && all(lessThan(prev_uv, vec2(1.0)));
+
+    vec3 accum = cur;
+    if (valid_hist) {
+        vec3 hist_rgb = sample_history_catmull_rom(prev_uv, vec2(pc.display_size));
+        vec3 hist_ycocg = clamp(rgb_to_ycocg(hist_rgb), box_min, box_max);
+        vec3 clipped = max(ycocg_to_rgb(hist_ycocg), vec3(0.0));
+        float mv_len = length(mv * vec2(pc.display_size));
+        float alpha = clamp(0.08 + mv_len * 0.02, 0.08, 0.35);
+        accum = mix(clipped, cur, alpha);
+    }
+
+    // Integrated RCAS (Robust Contrast Adaptive Sharpening)
+    vec2 d_inv = 1.0 / vec2(pc.display_size);
+    vec3 n = textureLod(in_color, uv + vec2(0.0, -d_inv.y), 0.0).rgb;
+    vec3 s = textureLod(in_color, uv + vec2(0.0,  d_inv.y), 0.0).rgb;
+    vec3 w = textureLod(in_color, uv + vec2(-d_inv.x, 0.0), 0.0).rgb;
+    vec3 e = textureLod(in_color, uv + vec2( d_inv.x, 0.0), 0.0).rgb;
+    vec3 min4 = min(min(n, s), min(w, e));
+    vec3 max4 = max(max(n, s), max(w, e));
+    vec3 lap = (n + s + w + e) * 0.25 - cur;
+    float contrast = clamp(1.0 - max(max4.g - min4.g, 0.0), 0.0, 1.0);
+    vec3 sharpened = max(accum - lap * (pc.sharpness * contrast * 0.35), vec3(0.0));
+
+    imageStore(out_history, px, vec4(accum, 1.0));
+    imageStore(out_upscaled, px, vec4(sharpened, 1.0));
+}

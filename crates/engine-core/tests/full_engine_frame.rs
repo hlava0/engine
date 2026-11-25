@@ -103,3 +103,135 @@ fn hud_menu_overlay_and_settings_toggle_headless() {
     assert!(pixels.iter().any(|p| p[0] > 0.01 && p[1] > 0.01));
     assert_eq!(engine.validation_errors(), 0);
 }
+
+#[test]
+fn fsr31_temporal_upscaler_two_frames_validation() {
+    use engine_core::upscaler::{FsrPreset, TemporalUpscalerPass};
+    use engine_rhi::ash::vk;
+    use engine_rhi::{GpuImage, RhiConfig, RhiDevice, sync};
+
+    let mut rhi = RhiDevice::new(RhiConfig {
+        app_name: "fsr31-upscale-test".to_string(),
+        enable_validation: true,
+        enable_sync_validation: true,
+        ..Default::default()
+    })
+    .expect("RhiDevice");
+
+    let (rw, rh) = FsrPreset::Performance.render_dimensions(128, 128);
+    assert_eq!((rw, rh), (64, 64));
+
+    let dev = rhi.device.clone();
+    let mut upscaler = TemporalUpscalerPass::new(&mut rhi, 128, 128).expect("TemporalUpscalerPass");
+
+    let in_color = GpuImage::create_2d(
+        &dev,
+        rhi.allocator_mut(),
+        rw,
+        rh,
+        1,
+        vk::Format::R16G16B16A16_SFLOAT,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        vk::ImageAspectFlags::COLOR,
+        "fsr_in_col",
+    )
+    .unwrap();
+    let in_motion = GpuImage::create_2d(
+        &dev,
+        rhi.allocator_mut(),
+        rw,
+        rh,
+        1,
+        vk::Format::R16G16_SFLOAT,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        vk::ImageAspectFlags::COLOR,
+        "fsr_in_mv",
+    )
+    .unwrap();
+    let in_depth = GpuImage::create_2d(
+        &dev,
+        rhi.allocator_mut(),
+        rw,
+        rh,
+        1,
+        vk::Format::R32_SFLOAT,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        vk::ImageAspectFlags::COLOR,
+        "fsr_in_depth",
+    )
+    .unwrap();
+
+    let pool = rhi
+        .create_command_pool(rhi.queue_families.graphics, vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+        .unwrap();
+    let cmd = rhi.allocate_command_buffer(pool).unwrap();
+
+    for f in 0..2 {
+        unsafe {
+            dev.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
+            dev.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+            if f == 0 {
+                let init = [
+                    sync::image_barrier(
+                        in_color.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        in_color.subresource_range(),
+                    ),
+                    sync::image_barrier(
+                        in_motion.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        in_motion.subresource_range(),
+                    ),
+                    sync::image_barrier(
+                        in_depth.image,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        in_depth.subresource_range(),
+                    ),
+                ];
+                sync::cmd_pipeline_barrier2(&dev, cmd, &[], &[], &init);
+            }
+        }
+        upscaler.record(
+            &rhi,
+            cmd,
+            &in_color,
+            &in_motion,
+            &in_depth,
+            [0.0, 0.0],
+            0.5,
+            f,
+        );
+        unsafe { dev.end_command_buffer(cmd).unwrap() };
+        rhi.submit_and_wait(rhi.graphics_queue, cmd).unwrap();
+    }
+
+    unsafe {
+        dev.device_wait_idle().unwrap();
+        dev.destroy_command_pool(pool, None);
+    }
+    upscaler.destroy(&mut rhi).unwrap();
+    in_color.destroy(&dev, rhi.allocator_mut()).unwrap();
+    in_motion.destroy(&dev, rhi.allocator_mut()).unwrap();
+    in_depth.destroy(&dev, rhi.allocator_mut()).unwrap();
+    assert_eq!(rhi.validation_errors(), 0);
+}

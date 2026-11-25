@@ -1,5 +1,6 @@
 //! Vulkan 1.4 RHI: instance/device bootstrap, capability probing, BDA buffers, bindless descriptors, images, and Synchronization2 helpers.
 
+pub mod async_queues;
 pub mod bindless;
 pub mod buffer;
 pub mod device;
@@ -18,6 +19,7 @@ pub use raw_window_handle;
 /// Number of frames kept in flight concurrently for CPU/GPU async pipelining.
 pub const FRAMES_IN_FLIGHT: usize = 2;
 
+pub use async_queues::AsyncQueueContext;
 pub use bindless::{BindlessConfig, BindlessTable};
 pub use buffer::GpuBuffer;
 pub use device::{

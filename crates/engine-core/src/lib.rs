@@ -5,7 +5,9 @@ pub mod engine;
 pub mod hud;
 pub mod pacer;
 pub mod profiler;
+pub mod render_graph;
 pub mod scene;
+pub mod upscaler;
 
 use engine_compute_ml::CoopMlError;
 use engine_rhi::RhiError;

@@ -38,6 +38,24 @@ pub struct RtParams {
     pub _pad: u32,
 }
 
+/// Bitflags passed via `RtParams::_pad` (`rt_flags`) to `shaders/rt_gi.comp`.
+pub const RT_FLAG_DISABLE_GI: u32 = 1 << 0;
+pub const RT_FLAG_CHECKERBOARD: u32 = 1 << 1;
+pub const RT_FLAG_RESTIR_GI: u32 = 1 << 2;
+pub const RT_FLAG_SER_AVAILABLE: u32 = 1 << 3;
+
+/// Per-pixel ReSTIR GI temporal reservoir stored in a ping-ponged BDA buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct RestirReservoir {
+    /// `xyz` = secondary hit direction (or world offset), `w` = hit distance.
+    pub dir_hit: [f32; 4],
+    /// `rgb` = demodulated indirect radiance, `a` = target PDF (luminance).
+    pub radiance_pdf: [f32; 4],
+    /// `x` = M (sample count), `y` = W (unbiased weight), `z` = view_z, `w` = normal_hash.
+    pub m_w_vz_norm: [f32; 4],
+}
+
 /// Push constants for `shaders/rt_gi.comp`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -45,6 +63,8 @@ pub struct RtGiPushConstants {
     pub params_ptr: u64,
     pub materials_ptr: u64,
     pub lights_ptr: u64,
+    pub prev_reservoirs_ptr: u64,
+    pub cur_reservoirs_ptr: u64,
 }
 
 /// Push constants for `shaders/nrd_compose.comp`.
@@ -68,7 +88,8 @@ mod tests {
         assert_eq!(offset_of!(RtParams, jitter_frame), 208);
         assert_eq!(offset_of!(RtParams, screen_size), 224);
         assert_eq!(offset_of!(RtParams, light_count), 232);
-        assert_eq!(size_of::<RtGiPushConstants>(), 24);
+        assert_eq!(size_of::<RestirReservoir>(), 48);
+        assert_eq!(size_of::<RtGiPushConstants>(), 40);
         assert_eq!(size_of::<ComposePushConstants>(), 8);
     }
 }

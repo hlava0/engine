@@ -10,5 +10,7 @@ rapier3d.workspace = true
 rhai.workspace = true
 rodio.workspace = true
 egui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true

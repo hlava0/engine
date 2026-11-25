@@ -14,7 +14,8 @@ use engine_rhi::{
     RhiConfig, RhiDevice, Swapchain, VendorProfile, sync,
 };
 use engine_rt_nrd::{
-    AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RtGiPass, RtParams,
+    AccelStructureManager, NrdComposePass, NrdDenoiser, NrdInputs, RT_FLAG_CHECKERBOARD,
+    RT_FLAG_DISABLE_GI, RT_FLAG_RESTIR_GI, RtGiPass, RtParams,
 };
 
 use crate::EngineError;
@@ -30,6 +31,8 @@ const DENOISING_RANGE: f32 = 1000.0;
 pub struct GraphicsSettings {
     pub enable_hiz_culling: bool,
     pub enable_rt_gi: bool,
+    pub checkerboard_gi: bool,
+    pub restir_gi: bool,
     pub enable_coop_ml: bool,
     pub fov_deg: f32,
 }
@@ -39,6 +42,8 @@ impl Default for GraphicsSettings {
         Self {
             enable_hiz_culling: true,
             enable_rt_gi: true,
+            checkerboard_gi: false,
+            restir_gi: true,
             enable_coop_ml: true,
             fov_deg: 65.0,
         }
@@ -713,6 +718,17 @@ impl Engine {
             is_first,
         )?;
 
+        let mut rt_flags = 0u32;
+        if !self.graphics_settings.enable_rt_gi {
+            rt_flags |= RT_FLAG_DISABLE_GI;
+        }
+        if self.graphics_settings.checkerboard_gi {
+            rt_flags |= RT_FLAG_CHECKERBOARD;
+        }
+        if self.graphics_settings.restir_gi {
+            rt_flags |= RT_FLAG_RESTIR_GI;
+        }
+
         let rt_params = RtParams {
             inv_view: self.world.camera.inv_view,
             inv_proj: self.world.camera.inv_proj,
@@ -731,7 +747,7 @@ impl Engine {
             ],
             screen_size: [self.width, self.height],
             light_count: self.world.lights.len() as u32,
-            _pad: u32::from(!self.graphics_settings.enable_rt_gi),
+            _pad: rt_flags,
         };
 
         let profiler = &mut self.frames[slot_idx].profiler;

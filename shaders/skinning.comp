@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct GpuVertex {
+    vec3 pos;
+    vec3 normal;
+    vec2 uv;
+};
+
+struct SkinWeight {
+    uvec4 joints;
+    vec4 weights;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer RestVertexBuf {
+    GpuVertex data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer SkinWeightBuf {
+    SkinWeight data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer BoneMatBuf {
+    mat4 bones[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer OutVertexBuf {
+    GpuVertex data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    RestVertexBuf rest_verts;
+    SkinWeightBuf weights;
+    BoneMatBuf bones;
+    OutVertexBuf out_verts;
+    uint vertex_count;
+    uint _pad;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.vertex_count) {
+        return;
+    }
+
+    GpuVertex v = pc.rest_verts.data[idx];
+    SkinWeight sw = pc.weights.data[idx];
+
+    mat4 skin_mat =
+        pc.bones.bones[sw.joints.x] * sw.weights.x +
+        pc.bones.bones[sw.joints.y] * sw.weights.y +
+        pc.bones.bones[sw.joints.z] * sw.weights.z +
+        pc.bones.bones[sw.joints.w] * sw.weights.w;
+
+    vec4 skinned_pos = skin_mat * vec4(v.pos, 1.0);
+    vec3 skinned_norm = normalize(mat3(skin_mat) * v.normal);
+
+    GpuVertex out_v;
+    out_v.pos = skinned_pos.xyz;
+    out_v.normal = skinned_norm;
+    out_v.uv = v.uv;
+    pc.out_verts.data[idx] = out_v;
+}

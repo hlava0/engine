@@ -1,9 +1,10 @@
 //! Core ECS components and `GameWorld` wrapper over `hecs::World`.
 
 use hecs::{DynamicBundle, Entity, World};
+use serde::{Deserialize, Serialize};
 
 /// Human-readable entity name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Name(pub String);
 
 impl Name {
@@ -13,7 +14,7 @@ impl Name {
 }
 
 /// 3D spatial transform with Euler angles (radians, XYZ intrinsic / ZYX extrinsic composition).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub position: [f32; 3],
     pub rotation_euler: [f32; 3],
@@ -79,7 +80,7 @@ impl Transform {
 }
 
 /// Associates an entity with a GPU scene mesh/material and optional render instance slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshRenderer {
     pub mesh_id: u32,
     pub material_id: u32,
@@ -87,7 +88,7 @@ pub struct MeshRenderer {
 }
 
 /// Dynamic or static rigid-body physics parameters.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RigidBody {
     pub velocity: [f32; 3],
     /// `0.0` denotes an immovable/static body.
@@ -117,7 +118,7 @@ impl RigidBody {
 }
 
 /// Collision shape component for `rapier3d` 3D rigid-body physics.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Collider {
     Sphere { radius: f32 },
     Box { half_extents: [f32; 3] },
@@ -149,7 +150,7 @@ pub struct PhysicsJoint {
 }
 
 /// Point light component attached to an entity's [`Transform`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PointLightComponent {
     pub color: [f32; 3],
     pub energy: f32,
@@ -157,7 +158,7 @@ pub struct PointLightComponent {
 }
 
 /// Rhai script attached to an entity; executed each tick by `ScriptEngine`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptComponent {
     pub source: String,
 }
@@ -171,7 +172,7 @@ impl ScriptComponent {
 }
 
 /// Procedural/triggerable audio source component.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AudioSource {
     pub frequency_hz: f32,
     pub triggered: bool,

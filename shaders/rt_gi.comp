@@ -36,10 +36,26 @@ layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Li
     GpuRtLight lights[];
 };
 
+struct RestirReservoir {
+    vec4 dir_hit;      // xyz = secondary direction, w = hit distance
+    vec4 radiance_pdf; // rgb = demodulated indirect radiance, a = target pdf (lum)
+    vec4 m_w_vz_norm;  // x = M, y = W, z = view_z, w = normal_hash
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer PrevReservoirBuf {
+    RestirReservoir data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) writeonly buffer CurReservoirBuf {
+    RestirReservoir data[];
+};
+
 layout(push_constant, scalar) uniform PushConstants {
     RtParamsBuf params;
     MaterialBuf materials;
     LightBuf lights;
+    PrevReservoirBuf prev_reservoirs;
+    CurReservoirBuf cur_reservoirs;
 } pc;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
@@ -54,6 +70,15 @@ layout(set = 0, binding = 7, rgb10_a2) uniform writeonly image2D out_nrd_normal_
 layout(set = 0, binding = 8, r16f) uniform writeonly image2D out_nrd_view_z;
 layout(set = 0, binding = 9, r8) uniform writeonly image2D out_nrd_diff_confidence;
 layout(set = 0, binding = 10, r8) uniform writeonly image2D out_nrd_spec_confidence;
+layout(set = 0, binding = 11) uniform sampler2D gbuf_motion;
+
+shared vec3 sh_diff[8][8];
+shared vec3 sh_spec[8][8];
+shared float sh_dhit[8][8];
+shared float sh_shit[8][8];
+shared float sh_vz[8][8];
+shared vec3 sh_n[8][8];
+shared uint sh_traced[8][8];
 
 #define PI 3.14159265359
 #define RAY_TMIN 0.002
@@ -256,80 +281,185 @@ void main() {
         imageStore(out_nrd_spec_confidence, texel, vec4(1.0));
     }
 
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    sh_traced[ly][lx] = 0u;
+    sh_vz[ly][lx] = -1.0;
+
     // Coherent subgroup early-out: skip ray-query traversal when all lanes hit sky/OOB
     // (avoids divergent empty ray launches on Intel Xe2 SIMD16 and AMD Wave32).
-    if (subgroupAll(is_sky)) {
+    bool checkerboard = (pc.params._pad & 2u) != 0u;
+    if (!checkerboard && subgroupAll(is_sky)) {
         return;
     }
+
+    vec3 diff_accum = vec3(0.0);
+    vec3 spec_accum = vec3(0.0);
+    float diff_hit_accum = 2.0;
+    float spec_hit_accum = 2.0;
+    vec3 N = vec3(0.0, 0.0, 1.0);
+    float roughness = 1.0;
+    vec3 diff_factor = vec3(1.0);
+    vec3 spec_factor = vec3(1.0);
+    float ndotv = 1.0;
+    uint frame_idx = uint(pc.params.jitter_frame.z);
+    uint seed = uint(texel.x * 1973 + texel.y * 9277) ^ (frame_idx * 26699u + 1u);
+    bool do_trace = !is_sky && (!checkerboard || (((uint(texel.x) + uint(texel.y) + frame_idx) & 1u) == 0u));
+
+    if (!is_sky) {
+        vec4 albedo_metallic = texelFetch(gbuf_albedo_metallic, texel, 0);
+        vec4 normal_roughness = texelFetch(gbuf_normal_roughness, texel, 0);
+        vec3 albedo = albedo_metallic.rgb;
+        float metallic = albedo_metallic.a;
+        N = normalize(normal_roughness.xyz);
+        roughness = clamp(normal_roughness.w, 0.02, 1.0);
+
+        vec4 wp = pc.params.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+        vec3 world_pos = wp.xyz / wp.w;
+        vec3 V = normalize(pc.params.cam_pos_range.xyz - world_pos);
+        ndotv = max(dot(N, V), 0.001);
+
+        vec3 diff_albedo = albedo * (1.0 - metallic);
+        diff_factor = max(diff_albedo, vec3(0.03));
+        vec3 f0 = mix(vec3(0.04), albedo, metallic);
+        vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
+        spec_factor = max(fresnel, vec3(0.03));
+
+        vec3 direct_diff = eval_direct_lights(world_pos, N, diff_albedo, denoising_range);
+        int spp = max(int(pc.params.jitter_frame.w + 0.5), 1);
+
+        if ((pc.params._pad & 1u) != 0u) {
+            vec3 amb_sky = sky_radiance(N, sun_dir, sun_energy);
+            diff_accum = direct_diff + diff_albedo * amb_sky * 0.35;
+            spec_accum = fresnel * amb_sky * 0.25;
+            do_trace = false;
+        } else if (do_trace) {
+            diff_hit_accum = 0.0;
+            spec_hit_accum = 0.0;
+            vec3 indirect_diff = vec3(0.0);
+            vec3 last_diff_dir = N;
+            for (int s = 0; s < spp; ++s) {
+                vec3 diff_dir = sample_cosine_hemisphere(N, seed);
+                SecondaryHit dh = trace_secondary(world_pos + N * RAY_TMIN, diff_dir, sun_dir, sun_energy, denoising_range);
+                indirect_diff += dh.radiance;
+                diff_hit_accum += dh.hit_dist;
+                last_diff_dir = diff_dir;
+
+                vec3 refl = reflect(-V, N);
+                vec3 spec_dir = normalize(mix(refl, sample_cosine_hemisphere(N, seed), roughness * roughness));
+                if (dot(spec_dir, N) <= 0.0) {
+                    spec_dir = refl;
+                }
+                SecondaryHit sh = trace_secondary(world_pos + N * RAY_TMIN, spec_dir, sun_dir, sun_energy, denoising_range);
+                spec_accum += fresnel * sh.radiance;
+                spec_hit_accum += sh.hit_dist;
+            }
+            indirect_diff /= float(spp);
+            spec_accum /= float(spp);
+            diff_hit_accum /= float(spp);
+            spec_hit_accum /= float(spp);
+
+            // ReSTIR GI Temporal Reservoir Resampling (when RT_FLAG_RESTIR_GI bit 2 is set)
+            if ((pc.params._pad & 4u) != 0u) {
+                float cand_lum = max(dot(indirect_diff, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+                float cand_w = 1.0;
+                float res_m = 1.0;
+                vec3 res_rad = indirect_diff;
+                vec3 res_dir = last_diff_dir;
+                float res_hit = diff_hit_accum;
+                float res_pdf = cand_lum;
+                float w_sum = cand_lum * cand_w;
+
+                if (frame_idx > 0u) {
+                    vec2 mv = texelFetch(gbuf_motion, texel, 0).rg;
+                    vec2 prev_uv = uv + mv;
+                    if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThan(prev_uv, vec2(1.0)))) {
+                        ivec2 pt = clamp(ivec2(prev_uv * vec2(size)), ivec2(0), ivec2(size) - 1);
+                        uint pidx = uint(pt.y) * uint(size.x) + uint(pt.x);
+                        RestirReservoir prev = pc.prev_reservoirs.data[pidx];
+                        float prev_vz = prev.m_w_vz_norm.z;
+                        float prev_m = min(prev.m_w_vz_norm.x, 20.0);
+                        if (prev_m > 0.0 && abs(prev_vz - view_z) < max(0.15 * view_z, 0.2)) {
+                            float prev_pdf = max(prev.radiance_pdf.a, 1e-4);
+                            float prev_w = max(prev.m_w_vz_norm.y, 0.0);
+                            float wi = prev_pdf * prev_w * prev_m;
+                            w_sum += wi;
+                            res_m += prev_m;
+                            if (rnd(seed) * w_sum < wi) {
+                                res_rad = prev.radiance_pdf.rgb;
+                                res_dir = prev.dir_hit.xyz;
+                                res_hit = prev.dir_hit.w;
+                                res_pdf = prev_pdf;
+                            }
+                        }
+                    }
+                }
+                float final_w = w_sum / max(res_m * res_pdf, 1e-4);
+                indirect_diff = res_rad * final_w;
+                diff_hit_accum = res_hit;
+
+                uint cidx = uint(texel.y) * uint(size.x) + uint(texel.x);
+                RestirReservoir out_r;
+                out_r.dir_hit = vec4(res_dir, res_hit);
+                out_r.radiance_pdf = vec4(res_rad, res_pdf);
+                out_r.m_w_vz_norm = vec4(res_m, final_w, view_z, dot(N, vec3(1.0, 2.0, 3.0)));
+                pc.cur_reservoirs.data[cidx] = out_r;
+            }
+
+            diff_accum = direct_diff + diff_albedo * indirect_diff;
+            sh_traced[ly][lx] = 1u;
+        } else {
+            // Checkerboard skipped pixel: still evaluate direct lighting locally
+            diff_accum = direct_diff;
+        }
+
+        sh_diff[ly][lx] = diff_accum;
+        sh_spec[ly][lx] = spec_accum;
+        sh_dhit[ly][lx] = diff_hit_accum;
+        sh_shit[ly][lx] = spec_hit_accum;
+        sh_vz[ly][lx] = view_z;
+        sh_n[ly][lx] = N;
+    }
+
+    if (checkerboard) {
+        barrier();
+        if (!is_sky && !do_trace && (pc.params._pad & 1u) == 0u) {
+            vec3 sum_d = vec3(0.0);
+            vec3 sum_s = vec3(0.0);
+            float sum_dh = 0.0;
+            float sum_sh = 0.0;
+            float w_tot = 0.0;
+            ivec2 offs[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+            for (int k = 0; k < 4; ++k) {
+                int nx = int(lx) + offs[k].x;
+                int ny = int(ly) + offs[k].y;
+                if (nx >= 0 && nx < 8 && ny >= 0 && ny < 8 && sh_traced[ny][nx] != 0u) {
+                    float nvz = sh_vz[ny][nx];
+                    float wd = exp(-abs(nvz - view_z) / max(0.1 * view_z, 0.05));
+                    float wn = pow(max(dot(sh_n[ny][nx], N), 0.0), 8.0);
+                    float w = wd * wn + 1e-4;
+                    sum_d += sh_diff[ny][nx] * w;
+                    sum_s += sh_spec[ny][nx] * w;
+                    sum_dh += sh_dhit[ny][nx] * w;
+                    sum_sh += sh_shit[ny][nx] * w;
+                    w_tot += w;
+                }
+            }
+            if (w_tot > 0.0) {
+                diff_accum = sum_d / w_tot;
+                spec_accum = sum_s / w_tot;
+                diff_hit_accum = sum_dh / w_tot;
+                spec_hit_accum = sum_sh / w_tot;
+            }
+        }
+    }
+
     if (is_sky) {
         return;
     }
 
-    vec4 albedo_metallic = texelFetch(gbuf_albedo_metallic, texel, 0);
-    vec4 normal_roughness = texelFetch(gbuf_normal_roughness, texel, 0);
-    vec3 albedo = albedo_metallic.rgb;
-    float metallic = albedo_metallic.a;
-    vec3 N = normalize(normal_roughness.xyz);
-    float roughness = clamp(normal_roughness.w, 0.02, 1.0);
-
-    // Reconstruct world position from G-buffer depth + inv_view_proj (no redundant primary ray!)
-    vec4 wp = pc.params.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
-    vec3 world_pos = wp.xyz / wp.w;
-    vec3 V = normalize(pc.params.cam_pos_range.xyz - world_pos);
-    float ndotv = max(dot(N, V), 0.001);
-
-    uint frame_idx = uint(pc.params.jitter_frame.z);
-    uint seed = uint(texel.x * 1973 + texel.y * 9277) ^ (frame_idx * 26699u + 1u);
-
-    // Material factors for demodulation (NRD_MaterialFactors style)
-    vec3 diff_albedo = albedo * (1.0 - metallic);
-    vec3 diff_factor = max(diff_albedo, vec3(0.03));
-
-    vec3 f0 = mix(vec3(0.04), albedo, metallic);
-    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
-    vec3 spec_factor = max(fresnel, vec3(0.03));
-
-    // Direct diffuse lighting at primary hit
-    vec3 direct_diff = eval_direct_lights(world_pos, N, diff_albedo, denoising_range);
-
-    int spp = max(int(pc.params.jitter_frame.w + 0.5), 1);
-    vec3 diff_accum = vec3(0.0);
-    vec3 spec_accum = vec3(0.0);
-    float diff_hit_accum = 0.0;
-    float spec_hit_accum = 0.0;
-
-    if (pc.params._pad != 0u) {
-        // Fast non-GI mode (toggled from Graphics Menu): direct lighting + hemisphere ambient
-        vec3 amb_sky = sky_radiance(N, sun_dir, sun_energy);
-        diff_accum = direct_diff + diff_albedo * amb_sky * 0.35;
-        spec_accum = fresnel * amb_sky * 0.25;
-        diff_hit_accum = 2.0;
-        spec_hit_accum = 2.0;
-        spp = 1;
-    } else {
-        for (int s = 0; s < spp; ++s) {
-            // Secondary diffuse GI ray
-            vec3 diff_dir = sample_cosine_hemisphere(N, seed);
-            SecondaryHit dh = trace_secondary(world_pos + N * RAY_TMIN, diff_dir, sun_dir, sun_energy, denoising_range);
-            diff_accum += direct_diff + diff_albedo * dh.radiance;
-            diff_hit_accum += dh.hit_dist;
-
-            // Secondary specular reflection ray
-            vec3 refl = reflect(-V, N);
-            vec3 spec_dir = normalize(mix(refl, sample_cosine_hemisphere(N, seed), roughness * roughness));
-            if (dot(spec_dir, N) <= 0.0) {
-                spec_dir = refl;
-            }
-            SecondaryHit sh = trace_secondary(world_pos + N * RAY_TMIN, spec_dir, sun_dir, sun_energy, denoising_range);
-            spec_accum += fresnel * sh.radiance;
-            spec_hit_accum += sh.hit_dist;
-        }
-    }
-
-    diff_accum /= float(spp);
-    spec_accum /= float(spp);
-    float diff_hit_dist = diff_hit_accum / float(spp);
-    float spec_hit_dist = spec_hit_accum / float(spp);
+    float diff_hit_dist = diff_hit_accum;
+    float spec_hit_dist = spec_hit_accum;
 
     // Demodulate radiance before NRD packing
     vec3 demod_diff = diff_accum / diff_factor;

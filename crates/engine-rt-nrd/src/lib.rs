@@ -16,4 +16,7 @@ pub use error::{Result, RtNrdError};
 pub use nrd::{DenoiserMode, NrdDenoiser, NrdInputs};
 pub use rt_pass::RtGiPass;
 pub use svgf::SvgfDenoiser;
-pub use types::{ComposePushConstants, GpuRtLight, GpuRtMaterial, RtGiPushConstants, RtParams};
+pub use types::{
+    ComposePushConstants, GpuRtLight, GpuRtMaterial, RT_FLAG_CHECKERBOARD, RT_FLAG_DISABLE_GI,
+    RT_FLAG_RESTIR_GI, RT_FLAG_SER_AVAILABLE, RestirReservoir, RtGiPushConstants, RtParams,
+};

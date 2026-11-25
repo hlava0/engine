@@ -6,7 +6,9 @@ use engine_rhi::{FRAMES_IN_FLIGHT, GpuBuffer, GpuImage, RhiDevice, load_shader_w
 
 use crate::accel::AccelStructureManager;
 use crate::error::Result;
-use crate::types::{GpuRtLight, GpuRtMaterial, RtGiPushConstants, RtParams};
+use crate::types::{
+    GpuRtLight, GpuRtMaterial, RT_FLAG_SER_AVAILABLE, RestirReservoir, RtGiPushConstants, RtParams,
+};
 
 /// Hardware ray-query GI + specular reflection + shadow pass producing demodulated NRD inputs.
 pub struct RtGiPass {
@@ -21,6 +23,7 @@ pub struct RtGiPass {
     pub params_buffers: [GpuBuffer; FRAMES_IN_FLIGHT],
     pub materials_buffer: GpuBuffer,
     pub lights_buffer: GpuBuffer,
+    pub restir_reservoirs: [GpuBuffer; 2],
 
     sampler: vk::Sampler,
     descriptor_pool: vk::DescriptorPool,
@@ -29,6 +32,8 @@ pub struct RtGiPass {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     first_frame: bool,
+    frame_counter: u64,
+    ser_available: bool,
 }
 
 impl RtGiPass {
@@ -134,6 +139,27 @@ impl RtGiPass {
         )?;
         materials_buffer.mapped_slice_mut()?.copy_from_slice(cast_slice(mat_slice));
 
+        let res_bytes = (width as usize * height as usize).max(1)
+            * std::mem::size_of::<RestirReservoir>();
+        let restir_reservoirs = [
+            GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                "rt-restir-0",
+                res_bytes as vk::DeviceSize,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
+            )?,
+            GpuBuffer::new(
+                &device,
+                rhi.allocator_mut(),
+                "rt-restir-1",
+                res_bytes as vk::DeviceSize,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
+            )?,
+        ];
+
         let default_light = [GpuRtLight::default()];
         let light_slice = if lights.is_empty() { &default_light } else { lights };
         let mut lights_buffer = GpuBuffer::new(
@@ -211,6 +237,11 @@ impl RtGiPass {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(11)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
 
         let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
@@ -224,7 +255,7 @@ impl RtGiPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 4,
+                descriptor_count: 5,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -278,6 +309,11 @@ impl RtGiPass {
             res.map_err(|(_, e)| e)?[0]
         };
 
+        let ser_available = rhi
+            .capabilities
+            .vendor_profile
+            .nv_ray_tracing_invocation_reorder;
+
         Ok(Self {
             extent: vk::Extent2D { width, height },
             nrd_diff_rad_hitdist,
@@ -289,6 +325,7 @@ impl RtGiPass {
             params_buffers,
             materials_buffer,
             lights_buffer,
+            restir_reservoirs,
             sampler,
             descriptor_pool,
             descriptor_set_layout,
@@ -296,6 +333,8 @@ impl RtGiPass {
             pipeline_layout,
             pipeline,
             first_frame: true,
+            frame_counter: 0,
+            ser_available,
         })
     }
 
@@ -344,6 +383,12 @@ impl RtGiPass {
         let out_sc_info = [vk::DescriptorImageInfo::default()
             .image_view(self.nrd_spec_confidence.view)
             .image_layout(vk::ImageLayout::GENERAL)];
+
+        let gbuf_motion_info = [vk::DescriptorImageInfo {
+            sampler: self.sampler,
+            image_view: gbuffer.motion.view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
 
         let mut accel_desc = vk::WriteDescriptorSet::default()
             .dst_set(self.descriptor_set)
@@ -404,6 +449,11 @@ impl RtGiPass {
                 .dst_binding(10)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&out_sc_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(11)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&gbuf_motion_info),
         ];
 
         unsafe {
@@ -427,9 +477,13 @@ impl RtGiPass {
         frame_slot: usize,
     ) -> Result<()> {
         let slot = frame_slot % FRAMES_IN_FLIGHT;
+        let mut effective_params = *params;
+        if self.ser_available {
+            effective_params._pad |= RT_FLAG_SER_AVAILABLE;
+        }
         self.params_buffers[slot]
             .mapped_slice_mut()?
-            .copy_from_slice(bytemuck::bytes_of(params));
+            .copy_from_slice(bytemuck::bytes_of(&effective_params));
 
         let out_old_layout = if self.first_frame {
             vk::ImageLayout::UNDEFINED
@@ -548,10 +602,14 @@ impl RtGiPass {
             ),
         ];
 
+        let prev_res_idx = ((self.frame_counter + 1) & 1) as usize;
+        let cur_res_idx = (self.frame_counter & 1) as usize;
         let pc = RtGiPushConstants {
             params_ptr: self.params_buffers[slot].device_address,
             materials_ptr: self.materials_buffer.device_address,
             lights_ptr: self.lights_buffer.device_address,
+            prev_reservoirs_ptr: self.restir_reservoirs[prev_res_idx].device_address,
+            cur_reservoirs_ptr: self.restir_reservoirs[cur_res_idx].device_address,
         };
 
         unsafe {
@@ -648,6 +706,7 @@ impl RtGiPass {
         }
 
         self.first_frame = false;
+        self.frame_counter = self.frame_counter.wrapping_add(1);
         Ok(())
     }
 
@@ -662,6 +721,9 @@ impl RtGiPass {
         }
         let alloc = rhi.allocator_mut();
         for buf in self.params_buffers {
+            buf.destroy(&device, alloc)?;
+        }
+        for buf in self.restir_reservoirs {
             buf.destroy(&device, alloc)?;
         }
         self.materials_buffer.destroy(&device, alloc)?;

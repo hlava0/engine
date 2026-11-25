@@ -237,3 +237,27 @@ fn rhai_velocity_impulse_and_spatial_audio_safe() {
     audio.play_spatial_beep(440.0, 10, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, -3.0]);
     audio.play_impact(180.0, 20);
 }
+
+#[test]
+fn scene_json_serialization_roundtrip() {
+    let mut game = GameWorld::new();
+    game.spawn((
+        Name::new("SavedSphere"),
+        Transform::from_position([1.5, 2.5, -3.5]),
+        RigidBody::dynamic(2.0, 0.75),
+        Collider::Sphere { radius: 0.6 },
+        ScriptComponent::new("ry += dt;"),
+    ));
+
+    let json = engine_gameplay::serialization::scene_to_json(&game.world).expect("scene_to_json");
+    let loaded = engine_gameplay::serialization::scene_from_json(&json).expect("scene_from_json");
+    assert_eq!(loaded.len(), 1);
+    let mut count = 0;
+    for (_, (name, tf, rb)) in loaded.query::<(&Name, &Transform, &RigidBody)>().iter() {
+        assert_eq!(name.0, "SavedSphere");
+        assert_eq!(tf.position, [1.5, 2.5, -3.5]);
+        assert!((rb.restitution - 0.75).abs() < 1e-5);
+        count += 1;
+    }
+    assert_eq!(count, 1);
+}

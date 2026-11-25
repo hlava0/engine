@@ -5,7 +5,7 @@ use std::path::Path;
 use engine_gpu_driven::GpuVertex;
 use engine_gpu_driven::types::{mat4_identity, mat4_mul};
 
-use crate::{AssetError, Result};
+use crate::{AssetError, Result, TextureData};
 
 /// A flattened mesh primitive extracted from a glTF 2.0 asset.
 #[derive(Debug, Clone)]
@@ -15,9 +15,12 @@ pub struct LoadedMesh {
     pub indices: Vec<u32>,
     /// `xyz` = local bounding sphere center, `w` = radius.
     pub bounding_sphere: [f32; 4],
+    /// Optional per-vertex joint indices (`[u16; 4]`) and weights (`[f32; 4]`) for compute skinning.
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
 }
 
-/// PBR metallic-roughness material factors extracted from a glTF 2.0 asset.
+/// PBR metallic-roughness material factors & texture indices extracted from a glTF 2.0 asset.
 #[derive(Debug, Clone)]
 pub struct LoadedMaterial {
     pub name: String,
@@ -25,6 +28,10 @@ pub struct LoadedMaterial {
     pub roughness: f32,
     pub metallic: f32,
     pub emissive: [f32; 3],
+    pub albedo_texture: Option<usize>,
+    pub normal_texture: Option<usize>,
+    pub metallic_roughness_texture: Option<usize>,
+    pub emissive_texture: Option<usize>,
 }
 
 impl Default for LoadedMaterial {
@@ -35,6 +42,10 @@ impl Default for LoadedMaterial {
             roughness: 0.5,
             metallic: 0.0,
             emissive: [0.0, 0.0, 0.0],
+            albedo_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            emissive_texture: None,
         }
     }
 }
@@ -55,24 +66,63 @@ pub struct LoadedScene {
     pub meshes: Vec<LoadedMesh>,
     pub materials: Vec<LoadedMaterial>,
     pub instances: Vec<LoadedInstance>,
+    pub textures: Vec<TextureData>,
 }
 
 /// Load a glTF 2.0 (`.gltf` or `.glb`) file from disk.
 pub fn load_gltf_from_path<P: AsRef<Path>>(path: P) -> Result<LoadedScene> {
-    let (document, buffers, _images) = gltf::import(path)?;
-    extract_scene(&document, &buffers)
+    let (document, buffers, images) = gltf::import(path)?;
+    extract_scene(&document, &buffers, &images)
 }
 
 /// Load a self-contained glTF 2.0 / binary `.glb` from an in-memory byte slice.
 pub fn load_gltf_from_slice(bytes: &[u8]) -> Result<LoadedScene> {
-    let (document, buffers, _images) = gltf::import_slice(bytes)?;
-    extract_scene(&document, &buffers)
+    let (document, buffers, images) = gltf::import_slice(bytes)?;
+    extract_scene(&document, &buffers, &images)
+}
+
+fn gltf_image_to_rgba8(img: &gltf::image::Data) -> TextureData {
+    let rgba8 = match img.format {
+        gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
+        gltf::image::Format::R8G8B8 => img
+            .pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        gltf::image::Format::R8G8 => img
+            .pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[1], 0, 255])
+            .collect(),
+        gltf::image::Format::R8 => img
+            .pixels
+            .iter()
+            .flat_map(|&g| [g, g, g, 255])
+            .collect(),
+        _ => {
+            // 16-bit or float formats: convert to 8-bit fallback
+            let px_count = (img.width * img.height) as usize;
+            vec![255u8; px_count * 4]
+        }
+    };
+    TextureData {
+        width: img.width,
+        height: img.height,
+        rgba8,
+    }
 }
 
 fn extract_scene(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
 ) -> Result<LoadedScene> {
+    let textures: Vec<TextureData> = images.iter().map(gltf_image_to_rgba8).collect();
+
     // 1. Extract materials (always guarantee at least one default material at the end if needed)
     let mut materials: Vec<LoadedMaterial> = document
         .materials()
@@ -89,6 +139,12 @@ fn extract_scene(
                 roughness: pbr.roughness_factor(),
                 metallic: pbr.metallic_factor(),
                 emissive: mat.emissive_factor(),
+                albedo_texture: pbr.base_color_texture().map(|t| t.texture().source().index()),
+                normal_texture: mat.normal_texture().map(|t| t.texture().source().index()),
+                metallic_roughness_texture: pbr
+                    .metallic_roughness_texture()
+                    .map(|t| t.texture().source().index()),
+                emissive_texture: mat.emissive_texture().map(|t| t.texture().source().index()),
             }
         })
         .collect();
@@ -163,11 +219,22 @@ fn extract_scene(
                 format!("{base_name}_prim{prim_idx}")
             };
 
+            let joints: Vec<[u16; 4]> = reader
+                .read_joints(0)
+                .map(|j| j.into_u16().collect())
+                .unwrap_or_default();
+            let weights: Vec<[f32; 4]> = reader
+                .read_weights(0)
+                .map(|w| w.into_f32().collect())
+                .unwrap_or_default();
+
             meshes.push(LoadedMesh {
                 name: prim_name,
                 vertices,
                 indices,
                 bounding_sphere,
+                joints,
+                weights,
             });
 
             let mat_idx = match primitive.material().index() {
@@ -220,6 +287,7 @@ fn extract_scene(
         meshes,
         materials,
         instances,
+        textures,
     })
 }
 

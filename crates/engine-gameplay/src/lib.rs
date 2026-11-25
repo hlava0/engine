@@ -6,6 +6,7 @@ pub mod ecs;
 pub mod editor;
 pub mod physics;
 pub mod scripting;
+pub mod serialization;
 
 pub use audio::AudioEngine;
 pub use ecs::{

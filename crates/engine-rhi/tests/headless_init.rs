@@ -208,3 +208,62 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
         "Expected 0 Vulkan validation warnings"
     );
 }
+
+#[test]
+fn async_transfer_and_compute_timeline_queues() {
+    let mut rhi = RhiDevice::new(RhiConfig {
+        app_name: "async-queue-test".to_string(),
+        enable_validation: true,
+        enable_sync_validation: true,
+        ..Default::default()
+    })
+    .expect("RhiDevice::new");
+
+    let dev = rhi.device.clone();
+    let mut src = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "async_src",
+        64,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        MemoryLocation::CpuToGpu,
+    )
+    .expect("src");
+    src.mapped_slice_mut().unwrap()[..4].copy_from_slice(&[1, 2, 3, 4]);
+
+    let dst = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "async_dst",
+        64,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::GpuToCpu,
+    )
+    .expect("dst");
+
+    let mut async_q = engine_rhi::AsyncQueueContext::new(&rhi).expect("AsyncQueueContext");
+    let t_ticket = async_q
+        .submit_transfer(&rhi, |d, cmd| {
+            let region = [vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: 64,
+            }];
+            unsafe { d.cmd_copy_buffer(cmd, src.buffer, dst.buffer, &region) };
+            Ok(())
+        })
+        .expect("submit_transfer");
+
+    let c_ticket = async_q
+        .submit_compute(&rhi, Some(t_ticket), |_d, _cmd| Ok(()))
+        .expect("submit_compute");
+
+    async_q.wait_compute_cpu(&rhi, c_ticket).expect("wait_compute_cpu");
+    assert_eq!(&dst.allocation.as_ref().unwrap().mapped_slice().unwrap()[..4], &[1, 2, 3, 4]);
+
+    unsafe { rhi.device.device_wait_idle().unwrap() };
+    async_q.destroy(&rhi);
+    src.destroy(&dev, rhi.allocator_mut()).unwrap();
+    dst.destroy(&dev, rhi.allocator_mut()).unwrap();
+    assert_eq!(rhi.validation_errors(), 0);
+}

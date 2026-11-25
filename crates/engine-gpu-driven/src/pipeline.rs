@@ -216,7 +216,7 @@ impl GpuDrivenPipeline {
         )?;
 
         // 3. G-buffer Dynamic Rendering graphics pipeline
-        let (geom_layout, geom_pipeline) = create_gbuffer_pipeline(rhi)?;
+        let (geom_layout, geom_pipeline) = create_gbuffer_pipeline(rhi, &set_layouts)?;
 
         Ok(Self {
             targets,
@@ -529,18 +529,29 @@ impl GpuDrivenPipeline {
             vertices_ptr: scene.vertex_buffer.device_address,
             instances_ptr: scene.instance_buffer.device_address,
             draw_instance_ids_ptr: scene.draw_instance_ids_buffer.device_address,
+            material_textures_ptr: scene.material_textures_address(),
+            default_sampler_idx: scene.default_sampler_idx,
+            _pad: 0,
         };
 
         unsafe {
             device.cmd_begin_rendering(cmd, &rendering_info);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.geom_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.geom_layout,
+                0,
+                &[bindless.set],
+                &[],
+            );
             device.cmd_set_viewport(cmd, 0, &viewport);
             device.cmd_set_scissor(cmd, 0, &scissor);
             device.cmd_bind_index_buffer(cmd, scene.index_buffer.buffer, 0, vk::IndexType::UINT32);
             device.cmd_push_constants(
                 cmd,
                 self.geom_layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&geom_pc),
             );
@@ -728,7 +739,10 @@ fn create_compute_pipeline(
     }
 }
 
-fn create_gbuffer_pipeline(rhi: &RhiDevice) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+fn create_gbuffer_pipeline(
+    rhi: &RhiDevice,
+    set_layouts: &[vk::DescriptorSetLayout],
+) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let device = &rhi.device;
     let vert_words = load_shader_words("gbuffer.vert")?;
     let frag_words = load_shader_words("gbuffer.frag")?;
@@ -747,10 +761,12 @@ fn create_gbuffer_pipeline(rhi: &RhiDevice) -> Result<(vk::PipelineLayout, vk::P
     };
 
     let pc_range = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
         .size(std::mem::size_of::<GeomPushConstants>() as u32)];
-    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_range);
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(set_layouts)
+        .push_constant_ranges(&pc_range);
     let layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
         Ok(l) => l,
         Err(err) => {

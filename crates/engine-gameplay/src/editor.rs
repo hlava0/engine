@@ -3,6 +3,7 @@
 use hecs::{Entity, World};
 
 use crate::ecs::{Name, RigidBody, ScriptComponent, Transform};
+use crate::serialization::{load_scene_file, save_scene_file};
 
 /// Runtime scene editor & `egui` property inspector.
 #[derive(Debug, Clone)]
@@ -108,8 +109,19 @@ impl SceneEditor {
                     {
                         self.toggle_pause();
                     }
-                    ui.checkbox(&mut self.show_physics, "Physics (Rapier3D)");
+                    if ui.button("Save JSON").clicked()
+                        && let Err(e) = save_scene_file(world, "scene_save.json")
+                    {
+                        log::warn!("Save scene failed: {e}");
+                    }
+                    if ui.button("Load JSON").clicked() {
+                        match load_scene_file("scene_save.json") {
+                            Ok(loaded) => *world = loaded,
+                            Err(e) => log::warn!("Load scene failed: {e}"),
+                        }
+                    }
                 });
+                ui.checkbox(&mut self.show_physics, "Physics (Rapier3D)");
                 ui.separator();
 
                 ui.label(format!("Entities ({})", entities.len()));

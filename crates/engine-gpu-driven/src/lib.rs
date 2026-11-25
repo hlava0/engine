@@ -2,12 +2,14 @@
 
 pub mod pipeline;
 pub mod scene;
+pub mod skinning;
 pub mod types;
 
 pub use pipeline::{GBufferTargets, GpuDrivenPipeline};
 pub use scene::GpuScene;
+pub use skinning::{ComputeSkinningPass, GpuSkinWeight, SkinningPushConstants};
 pub use types::{
     CULL_FLAG_FRUSTUM, CULL_FLAG_HIZ, CullPushConstants, DrawIndexedIndirectCommand,
-    FrameUniforms, GeomPushConstants, GpuInstanceData, GpuMeshDrawInfo, GpuVertex,
-    HizDownsamplePushConstants,
+    FrameUniforms, GeomPushConstants, GpuInstanceData, GpuMaterialTextures, GpuMeshDrawInfo,
+    GpuVertex, HizDownsamplePushConstants,
 };

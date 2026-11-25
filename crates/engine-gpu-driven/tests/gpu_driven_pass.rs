@@ -232,3 +232,129 @@ fn headless_gpu_driven_frustum_and_hiz_cull() {
         "Vulkan validation warnings detected!"
     );
 }
+
+#[test]
+fn compute_skinning_vulkan_validation() {
+    use engine_gpu_driven::{ComputeSkinningPass, GpuSkinWeight, GpuVertex, SkinningPushConstants};
+    use engine_rhi::gpu_allocator::MemoryLocation;
+    use engine_rhi::{GpuBuffer, RhiConfig, RhiDevice, ash::vk};
+
+    let mut rhi = RhiDevice::new(RhiConfig {
+        app_name: "skinning-test".to_string(),
+        enable_validation: true,
+        enable_sync_validation: true,
+        ..Default::default()
+    })
+    .expect("RhiDevice");
+
+    let skin_pass = ComputeSkinningPass::new(&rhi).expect("ComputeSkinningPass");
+    let dev = rhi.device.clone();
+
+    let rest = [GpuVertex {
+        pos: [1.0, 0.0, 0.0],
+        normal: [0.0, 1.0, 0.0],
+        uv: [0.5, 0.5],
+    }];
+    let weights = [GpuSkinWeight {
+        joints: [0, 0, 0, 0],
+        weights: [1.0, 0.0, 0.0, 0.0],
+    }];
+    // Translation by +5.0 on X
+    let bone: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [5.0, 0.0, 0.0, 1.0],
+    ];
+
+    let mut rest_buf = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "skin_rest",
+        std::mem::size_of_val(&rest) as vk::DeviceSize,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::CpuToGpu,
+    )
+    .unwrap();
+    rest_buf
+        .mapped_slice_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::bytes_of(&rest));
+
+    let mut weight_buf = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "skin_weights",
+        std::mem::size_of_val(&weights) as vk::DeviceSize,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::CpuToGpu,
+    )
+    .unwrap();
+    weight_buf
+        .mapped_slice_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::bytes_of(&weights));
+
+    let mut bone_buf = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "skin_bones",
+        std::mem::size_of_val(&bone) as vk::DeviceSize,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::CpuToGpu,
+    )
+    .unwrap();
+    bone_buf
+        .mapped_slice_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::bytes_of(&bone));
+
+    let out_buf = GpuBuffer::new(
+        &dev,
+        rhi.allocator_mut(),
+        "skin_out",
+        std::mem::size_of_val(&rest) as vk::DeviceSize,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::GpuToCpu,
+    )
+    .unwrap();
+
+    let pool = rhi
+        .create_command_pool(rhi.queue_families.graphics, vk::CommandPoolCreateFlags::TRANSIENT)
+        .unwrap();
+    let cmd = rhi.allocate_command_buffer(pool).unwrap();
+    unsafe {
+        dev.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .unwrap();
+    }
+    skin_pass.dispatch(
+        &rhi,
+        cmd,
+        &SkinningPushConstants {
+            rest_verts_ptr: rest_buf.device_address,
+            weights_ptr: weight_buf.device_address,
+            bones_ptr: bone_buf.device_address,
+            out_verts_ptr: out_buf.device_address,
+            vertex_count: 1,
+            _pad: 0,
+        },
+    );
+    unsafe { dev.end_command_buffer(cmd).unwrap() };
+    rhi.submit_and_wait(rhi.graphics_queue, cmd).unwrap();
+
+    let out_bytes = out_buf.allocation.as_ref().unwrap().mapped_slice().unwrap();
+    let out_v: &GpuVertex = bytemuck::from_bytes(&out_bytes[..std::mem::size_of::<GpuVertex>()]);
+    assert!((out_v.pos[0] - 6.0).abs() < 1e-4, "Expected x=6.0, got {}", out_v.pos[0]);
+
+    unsafe { dev.destroy_command_pool(pool, None) };
+    skin_pass.destroy(&rhi);
+    rest_buf.destroy(&dev, rhi.allocator_mut()).unwrap();
+    weight_buf.destroy(&dev, rhi.allocator_mut()).unwrap();
+    bone_buf.destroy(&dev, rhi.allocator_mut()).unwrap();
+    out_buf.destroy(&dev, rhi.allocator_mut()).unwrap();
+    assert_eq!(rhi.validation_errors(), 0);
+}
