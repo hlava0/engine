@@ -1,0 +1,193 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_textures[];
+layout(set = 0, binding = 3) uniform sampler u_samplers[];
+
+struct GpuInstanceData {
+    mat4 model;
+    mat4 prev_model;
+    vec4 albedo_metallic;
+    uint mesh_id;
+    uint material_id;
+    float roughness;
+    uint _pad;
+};
+
+struct GpuMeshDrawInfo {
+    vec4 bounding_sphere; // xyz = local center, w = local radius
+    uint index_count;
+    uint first_index;
+    int vertex_offset;
+    uint _pad;
+};
+
+struct DrawIndexedIndirectCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer FrameUniformsBuf {
+    mat4 view;
+    mat4 proj;
+    mat4 view_proj;
+    mat4 prev_view_proj;
+    vec4 frustum_planes[6];
+    vec4 jitter;
+    uvec2 screen_size;
+    uvec2 hiz_size;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer InstanceBuf {
+    GpuInstanceData data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MeshBuf {
+    GpuMeshDrawInfo data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer IndirectDrawBuf {
+    DrawIndexedIndirectCommand cmds[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer DrawCountBuf {
+    uint count;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer DrawInstanceIdBuf {
+    uint ids[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    FrameUniformsBuf frame_uniforms;
+    InstanceBuf instances;
+    MeshBuf meshes;
+    IndirectDrawBuf indirect_draws;
+    DrawCountBuf draw_count;
+    DrawInstanceIdBuf draw_instance_ids;
+    uint instance_count;
+    uint hiz_bindless_index;
+    uint hiz_sampler_index;
+    uint cull_flags; // bit 0 = frustum, bit 1 = Hi-Z
+} pc;
+
+bool frustum_cull(vec3 world_center, float world_radius, FrameUniformsBuf frame) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = frame.frustum_planes[i];
+        float dist = dot(plane.xyz, world_center) + plane.w;
+        if (dist < -world_radius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool hiz_cull(vec3 world_center, float world_radius, FrameUniformsBuf frame) {
+    // Project the 8 corners of the world-space AABB enclosing the bounding sphere.
+    vec3 min_p = world_center - vec3(world_radius);
+    vec3 max_p = world_center + vec3(world_radius);
+
+    vec2 uv_min = vec2(1.0);
+    vec2 uv_max = vec2(0.0);
+    float nearest_depth = 0.0; // Reverse-Z: near = 1.0, far = 0.0
+
+    for (int i = 0; i < 8; ++i) {
+        vec3 corner = vec3(
+            (i & 1) != 0 ? max_p.x : min_p.x,
+            (i & 2) != 0 ? max_p.y : min_p.y,
+            (i & 4) != 0 ? max_p.z : min_p.z
+        );
+        vec4 clip = frame.view_proj * vec4(corner, 1.0);
+        if (clip.w <= 0.0001) {
+            // Intersects near/camera plane: conservatively keep visible.
+            return true;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        vec2 uv = ndc.xy * 0.5 + 0.5;
+        uv_min = min(uv_min, uv);
+        uv_max = max(uv_max, uv);
+        nearest_depth = max(nearest_depth, ndc.z);
+    }
+
+    uv_min = clamp(uv_min, vec2(0.0), vec2(1.0));
+    uv_max = clamp(uv_max, vec2(0.0), vec2(1.0));
+
+    if (uv_max.x <= uv_min.x || uv_max.y <= uv_min.y) {
+        return true;
+    }
+
+    vec2 rect_px = (uv_max - uv_min) * vec2(frame.hiz_size);
+    float max_dim = max(rect_px.x, rect_px.y);
+    float mip = ceil(log2(max(max_dim, 1.0)));
+
+    uint tex_idx = nonuniformEXT(pc.hiz_bindless_index);
+    uint samp_idx = nonuniformEXT(pc.hiz_sampler_index);
+
+    // Sample all 4 corners at the chosen mip and take min to be conservative with a standard sampler.
+    float d0 = textureLod(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), vec2(uv_min.x, uv_min.y), mip).r;
+    float d1 = textureLod(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), vec2(uv_max.x, uv_min.y), mip).r;
+    float d2 = textureLod(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), vec2(uv_min.x, uv_max.y), mip).r;
+    float d3 = textureLod(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), vec2(uv_max.x, uv_max.y), mip).r;
+    float hiz_min_depth = min(min(d0, d1), min(d2, d3));
+
+    // Reverse-Z: smaller depth is farther away. If nearest point of sphere is farther than Hi-Z min depth, cull.
+    return nearest_depth >= hiz_min_depth;
+}
+
+void main() {
+    uint instance_id = gl_GlobalInvocationID.x;
+    bool visible = instance_id < pc.instance_count;
+    GpuMeshDrawInfo mesh;
+
+    if (visible) {
+        GpuInstanceData inst = pc.instances.data[instance_id];
+        mesh = pc.meshes.data[inst.mesh_id];
+
+        vec3 world_center = (inst.model * vec4(mesh.bounding_sphere.xyz, 1.0)).xyz;
+        float sx = length(inst.model[0].xyz);
+        float sy = length(inst.model[1].xyz);
+        float sz = length(inst.model[2].xyz);
+        float world_radius = mesh.bounding_sphere.w * max(sx, max(sy, sz));
+
+        if ((pc.cull_flags & 1u) != 0u) {
+            visible = frustum_cull(world_center, world_radius, pc.frame_uniforms);
+        }
+
+        if (visible && (pc.cull_flags & 2u) != 0u) {
+            visible = hiz_cull(world_center, world_radius, pc.frame_uniforms);
+        }
+    }
+
+    // Subgroup-ballot compaction: one global atomicAdd per subgroup instead of per thread
+    // (16x less atomic contention on Intel Xe2 SIMD16, 32x less on AMD Wave32 / NVIDIA Warp32).
+    uvec4 mask = subgroupBallot(visible);
+    uint sg_count = subgroupBallotBitCount(mask);
+    uint sg_offset = subgroupBallotExclusiveBitCount(mask);
+    uint base_idx = 0u;
+    if (subgroupElect() && sg_count > 0u) {
+        base_idx = atomicAdd(pc.draw_count.count, sg_count);
+    }
+    base_idx = subgroupBroadcastFirst(base_idx);
+
+    if (visible) {
+        uint idx = base_idx + sg_offset;
+
+        DrawIndexedIndirectCommand cmd;
+        cmd.index_count = mesh.index_count;
+        cmd.instance_count = 1u;
+        cmd.first_index = mesh.first_index;
+        cmd.vertex_offset = mesh.vertex_offset;
+        cmd.first_instance = idx;
+
+        pc.indirect_draws.cmds[idx] = cmd;
+        pc.draw_instance_ids.ids[idx] = instance_id;
+    }
+}

@@ -1,0 +1,33 @@
+# Third-Party Notices & License Compliance
+
+This repository (`hlava0/engine`) is licensed under the **GNU General Public License, Version 3 (`GPL-3.0-only`)** — see [`LICENSE`](LICENSE) — with a **GPL-3.0 Section 7 Additional Permission** for linking the external NVIDIA NRD SDK — see [`LICENSE-NRD-EXCEPTION.md`](LICENSE-NRD-EXCEPTION.md).
+
+## External Proprietary Dependency: NVIDIA Real-Time Denoisers (NRD) SDK
+
+This repository does **not** include, vendor, or redistribute any files from the NVIDIA Real-Time Denoisers (NRD) SDK (headers, shaders, or static libraries).
+
+- `crates/engine-rt-nrd` links against a user-supplied local installation of the NVIDIA NRD SDK configured via the `NRD_SDK_DIR` environment variable.
+- The NVIDIA NRD SDK is proprietary software provided by NVIDIA Corporation under the **NVIDIA RTX SDKs License** and is **not** subject to the GNU GPL v3.0.
+- Under [`LICENSE-NRD-EXCEPTION.md`](LICENSE-NRD-EXCEPTION.md) (GPL-3.0 Section 7), linking with NVIDIA NRD does **not** require NRD to be disclosed in source form or licensed under the GPL, preserving compliance with Section 4(e) of the NVIDIA RTX SDKs License.
+- Users building `engine-rt-nrd` or `engine-core` must obtain the NVIDIA NRD SDK separately from NVIDIA and comply with all terms of the NVIDIA RTX SDKs License (including no implied endorsement by NVIDIA).
+
+## Architectural Reference: Godot Engine (MIT License — GPL-3.0 Compatible)
+
+Portions of the ray-tracing and NRD host integration design were informed by and migrated from a Godot 4 integration prototype:
+
+> Copyright (c) 2014-present Godot Engine contributors.
+> Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+> Licensed under the MIT License (https://godotengine.org/license), which is compatible with GNU GPL v3.0.
+
+## Rust Crate Dependencies (All GPL-3.0 Compatible)
+
+All Cargo dependencies resolved in `Cargo.lock` use permissive open-source licenses compatible with **GNU GPL v3.0**:
+
+- `ash` — `MIT OR Apache-2.0`
+- `gpu-allocator` — `MIT OR Apache-2.0`
+- `bytemuck` / `bytemuck_derive` — `Zlib OR Apache-2.0 OR MIT`
+- `thiserror` — `MIT OR Apache-2.0`
+- `log` / `env_logger` — `MIT OR Apache-2.0`
+- `cc` — `MIT OR Apache-2.0`
+- `libloading` — `ISC`
+- Transitive crates: `MIT`, `Apache-2.0`, `Unlicense`, `ISC`, `Zlib`, `Unicode-3.0`.

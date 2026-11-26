@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_textures[];
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_images[];
+layout(set = 0, binding = 3) uniform sampler u_samplers[];
+
+layout(push_constant) uniform PushConstants {
+    uint src_texture_idx;
+    uint src_sampler_idx;
+    uint dst_image_idx;
+    uint dst_width;
+    uint dst_height;
+    uint is_first_mip;
+} pc;
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.dst_width || gid.y >= pc.dst_height) {
+        return;
+    }
+
+    uint tex_idx = nonuniformEXT(pc.src_texture_idx);
+    uint samp_idx = nonuniformEXT(pc.src_sampler_idx);
+    uint img_idx = nonuniformEXT(pc.dst_image_idx);
+
+    float depth;
+    if (pc.is_first_mip != 0u) {
+        depth = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(gid), 0).r;
+    } else {
+        ivec2 src_size = textureSize(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), 0);
+        ivec2 base = ivec2(gid) * 2;
+        ivec2 p00 = clamp(base + ivec2(0, 0), ivec2(0), src_size - 1);
+        ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), src_size - 1);
+        ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), src_size - 1);
+        ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), src_size - 1);
+
+        float d00 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), p00, 0).r;
+        float d10 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), p10, 0).r;
+        float d01 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), p01, 0).r;
+        float d11 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), p11, 0).r;
+        depth = min(min(d00, d10), min(d01, d11));
+
+        // Conservative reduction for odd source dimensions on the trailing edge.
+        bool extra_x = (base.x + 2 == src_size.x - 1);
+        bool extra_y = (base.y + 2 == src_size.y - 1);
+        if (extra_x) {
+            float dx0 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(base.x + 2, p00.y), 0).r;
+            float dx1 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(base.x + 2, p01.y), 0).r;
+            depth = min(depth, min(dx0, dx1));
+        }
+        if (extra_y) {
+            float dy0 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(p00.x, base.y + 2), 0).r;
+            float dy1 = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(p10.x, base.y + 2), 0).r;
+            depth = min(depth, min(dy0, dy1));
+        }
+        if (extra_x && extra_y) {
+            float dxy = texelFetch(sampler2D(u_textures[tex_idx], u_samplers[samp_idx]), ivec2(base.x + 2, base.y + 2), 0).r;
+            depth = min(depth, dxy);
+        }
+    }
+
+    imageStore(u_images[img_idx], ivec2(gid), vec4(depth, 0.0, 0.0, 0.0));
+}

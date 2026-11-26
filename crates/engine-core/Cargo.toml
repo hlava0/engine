@@ -1,0 +1,18 @@
+[package]
+name = "engine-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-rhi = { path = "../engine-rhi" }
+engine-gpu-driven = { path = "../engine-gpu-driven" }
+engine-rt-nrd = { path = "../engine-rt-nrd" }
+engine-compute-ml = { path = "../engine-compute-ml" }
+ash.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

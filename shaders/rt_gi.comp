@@ -1,0 +1,344 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct GpuRtMaterial {
+    vec4 albedo_roughness;  // rgb = albedo, a = roughness
+    vec4 emission_metallic; // rgb = emission, a = metallic
+};
+
+struct GpuRtLight {
+    vec4 pos_energy;  // xyz = position, w = energy
+    vec4 dir_type;    // xyz = direction, w = type (0 = dir, 1 = omni, 2 = spot)
+    vec4 color_range; // rgb = color, a = range
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer RtParamsBuf {
+    mat4 inv_view;
+    mat4 inv_proj;
+    mat4 inv_view_proj;
+    vec4 cam_pos_range; // xyz = camera world pos, w = denoising_range
+    vec4 jitter_frame;  // xy = current NDC jitter, z = frame_index, w = spp
+    uvec2 screen_size;
+    uint light_count;
+    uint _pad;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer MaterialBuf {
+    GpuRtMaterial mats[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer LightBuf {
+    GpuRtLight lights[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    RtParamsBuf params;
+    MaterialBuf materials;
+    LightBuf lights;
+} pc;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1) uniform sampler2D gbuf_albedo_metallic;
+layout(set = 0, binding = 2) uniform sampler2D gbuf_normal_roughness;
+layout(set = 0, binding = 3) uniform sampler2D gbuf_view_z;
+layout(set = 0, binding = 4) uniform sampler2D gbuf_depth;
+
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D out_nrd_diff_rad_hitdist;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D out_nrd_spec_rad_hitdist;
+layout(set = 0, binding = 7, rgb10_a2) uniform writeonly image2D out_nrd_normal_roughness;
+layout(set = 0, binding = 8, r16f) uniform writeonly image2D out_nrd_view_z;
+layout(set = 0, binding = 9, r8) uniform writeonly image2D out_nrd_diff_confidence;
+layout(set = 0, binding = 10, r8) uniform writeonly image2D out_nrd_spec_confidence;
+
+#define PI 3.14159265359
+#define RAY_TMIN 0.002
+
+uint pcg_hash(inout uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    seed = (word >> 22u) ^ word;
+    return seed;
+}
+
+float rnd(inout uint seed) {
+    return float(pcg_hash(seed)) / 4294967295.0;
+}
+
+vec3 sample_cosine_hemisphere(vec3 n, inout uint seed) {
+    float u1 = rnd(seed);
+    float u2 = rnd(seed);
+    float r = sqrt(u1);
+    float theta = 2.0 * PI * u2;
+    vec3 up = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, n));
+    vec3 bitangent = cross(n, tangent);
+    return normalize(tangent * (r * cos(theta)) + bitangent * (r * sin(theta)) + n * sqrt(max(0.0, 1.0 - u1)));
+}
+
+vec3 sky_radiance(vec3 dir, vec3 sun_dir, float sun_energy) {
+    float h = clamp(dir.y, -1.0, 1.0);
+    vec3 zenith = vec3(0.10, 0.28, 0.72);
+    vec3 horizon = vec3(0.62, 0.76, 0.96);
+    vec3 ground = vec3(0.28, 0.30, 0.34);
+    vec3 base = mix(horizon, zenith, pow(clamp(h, 0.0, 1.0), 0.45));
+    base = mix(base, ground, clamp(-h * 3.0, 0.0, 1.0));
+
+    float d = dot(dir, normalize(sun_dir));
+    vec3 sun_color = vec3(1.0, 0.95, 0.85);
+    float disk = smoothstep(0.9985, 0.9995, d);
+    float glow = pow(max(d, 0.0), 40.0) * 0.10 + pow(max(d, 0.0), 8.0) * 0.02;
+    return base + sun_color * (disk * 4.0 + glow) * max(sun_energy, 0.2);
+}
+
+bool is_occluded(vec3 origin, vec3 dir, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+        0xff,
+        origin,
+        RAY_TMIN,
+        dir,
+        tmax
+    );
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+vec3 eval_direct_lights(vec3 pos, vec3 n, vec3 diff_albedo, float denoising_range) {
+    vec3 direct = vec3(0.0);
+    uint count = pc.params.light_count;
+    for (uint i = 0u; i < count; ++i) {
+        GpuRtLight L = pc.lights.lights[i];
+        vec3 wi;
+        float atten = 1.0;
+        float tmax = denoising_range;
+        float ltype = L.dir_type.w;
+        if (ltype < 0.5) {
+            wi = normalize(-L.dir_type.xyz);
+        } else {
+            vec3 d = L.pos_energy.xyz - pos;
+            float dist = length(d);
+            if (dist < 1e-4) {
+                continue;
+            }
+            wi = d / dist;
+            float range = max(L.color_range.a, 1e-3);
+            atten = (1.0 / (1.0 + dist * dist)) * max(0.0, 1.0 - dist / range);
+            if (ltype > 1.5) {
+                float cosang = dot(-wi, normalize(L.dir_type.xyz));
+                atten *= smoothstep(0.5, 0.95, cosang);
+            }
+            tmax = dist;
+        }
+        float ndl = max(dot(n, wi), 0.0);
+        if (ndl <= 0.0) {
+            continue;
+        }
+        if (is_occluded(pos + n * RAY_TMIN, wi, tmax)) {
+            continue;
+        }
+        direct += diff_albedo * (1.0 / PI) * L.color_range.rgb * L.pos_energy.w * ndl * atten;
+    }
+    return direct;
+}
+
+struct SecondaryHit {
+    bool hit;
+    float hit_dist;
+    vec3 radiance;
+};
+
+SecondaryHit trace_secondary(vec3 origin, vec3 dir, vec3 sun_dir, float sun_energy, float denoising_range) {
+    SecondaryHit res;
+    res.hit = false;
+    res.hit_dist = denoising_range;
+    res.radiance = vec3(0.0);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, origin, RAY_TMIN, dir, denoising_range);
+    while (rayQueryProceedEXT(rq)) {}
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        res.hit = true;
+        res.hit_dist = rayQueryGetIntersectionTEXT(rq, true);
+        vec3 hit_pos = origin + dir * res.hit_dist;
+        uint mat_id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        GpuRtMaterial m = pc.materials.mats[mat_id];
+
+        // Estimate geometric normal from barycentrics/face or fallback to -dir hemisphere
+        vec3 n = -dir;
+        mat4x3 obj_to_world = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        n = normalize(obj_to_world[1]);
+        // Use a simple hemisphere-aligned normal for secondary bounce shading
+        if (dot(n, -dir) < 0.0) {
+            n = -n;
+        }
+
+        vec3 diff_albedo = m.albedo_roughness.rgb * (1.0 - m.emission_metallic.a);
+        res.radiance = m.emission_metallic.rgb + eval_direct_lights(hit_pos, n, diff_albedo, denoising_range);
+    } else {
+        res.radiance = sky_radiance(dir, sun_dir, sun_energy);
+    }
+    return res;
+}
+
+vec3 nrd_linear_to_ycocg(vec3 c) {
+    return vec3(
+        dot(c, vec3(0.25, 0.5, 0.25)),
+        dot(c, vec3(0.5, 0.0, -0.5)),
+        dot(c, vec3(-0.25, 0.5, -0.25))
+    );
+}
+
+// Matches NRD_FrontEnd_PackNormalAndRoughness for NormalEncoding::R10_G10_B10_A2_UNORM
+vec3 nrd_encode_normal_roughness(vec3 n, float roughness) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z) + 1.0e-6;
+    vec3 r;
+    r.y = n.y * 0.5 + 0.5;
+    r.x = n.x * 0.5 + r.y;
+    r.y -= n.x * 0.5;
+    roughness = max(roughness, 1.5 / 512.0);
+    float s = n.z < 0.0 ? -roughness : roughness;
+    r.z = s * 0.5 + 0.5;
+    return r;
+}
+
+float nrd_get_norm_hit_dist(float hit_dist, float view_z, float roughness) {
+    float smc = (1.0 - exp2(-200.0 * roughness * roughness)) * sqrt(clamp(roughness, 0.0, 1.0));
+    float hd_scale = (3.0 + abs(view_z) * 0.1) * mix(20.0, 1.0, smc);
+    return clamp(hit_dist / max(hd_scale, 1e-4), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 size = pc.params.screen_size;
+    bool in_bounds = texel.x < int(size.x) && texel.y < int(size.y);
+
+    float denoising_range = pc.params.cam_pos_range.w;
+    float view_z = 0.0;
+    float depth = 0.0;
+    if (in_bounds) {
+        view_z = texelFetch(gbuf_view_z, texel, 0).r;
+        depth = texelFetch(gbuf_depth, texel, 0).r;
+    }
+
+    // Extract sun direction from first directional light
+    vec3 sun_dir = vec3(0.4, 0.8, -0.45);
+    float sun_energy = 1.0;
+    for (uint i = 0u; i < pc.params.light_count; ++i) {
+        if (pc.lights.lights[i].dir_type.w < 0.5) {
+            sun_dir = -pc.lights.lights[i].dir_type.xyz;
+            sun_energy = max(pc.lights.lights[i].pos_energy.w, 0.2);
+            break;
+        }
+    }
+
+    bool is_sky = !in_bounds || view_z <= 0.0 || depth <= 0.0 || view_z >= denoising_range;
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+
+    if (is_sky && in_bounds) {
+        vec2 ndc_unjittered = (uv * 2.0 - 1.0) - pc.params.jitter_frame.xy;
+        vec4 far_world = pc.params.inv_view_proj * vec4(ndc_unjittered, 0.0, 1.0);
+        vec3 primary_dir = normalize(far_world.xyz / far_world.w - pc.params.cam_pos_range.xyz);
+        vec3 sky = sky_radiance(primary_dir, sun_dir, sun_energy);
+        imageStore(out_nrd_view_z, texel, vec4(denoising_range + 100.0, 0.0, 0.0, 0.0));
+        imageStore(out_nrd_normal_roughness, texel, vec4(nrd_encode_normal_roughness(vec3(0.0, 0.0, 1.0), 1.0), 0.0));
+        imageStore(out_nrd_diff_rad_hitdist, texel, vec4(nrd_linear_to_ycocg(sky), 1.0));
+        imageStore(out_nrd_spec_rad_hitdist, texel, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(out_nrd_diff_confidence, texel, vec4(1.0));
+        imageStore(out_nrd_spec_confidence, texel, vec4(1.0));
+    }
+
+    // Coherent subgroup early-out: skip ray-query traversal when all lanes hit sky/OOB
+    // (avoids divergent empty ray launches on Intel Xe2 SIMD16 and AMD Wave32).
+    if (subgroupAll(is_sky)) {
+        return;
+    }
+    if (is_sky) {
+        return;
+    }
+
+    vec4 albedo_metallic = texelFetch(gbuf_albedo_metallic, texel, 0);
+    vec4 normal_roughness = texelFetch(gbuf_normal_roughness, texel, 0);
+    vec3 albedo = albedo_metallic.rgb;
+    float metallic = albedo_metallic.a;
+    vec3 N = normalize(normal_roughness.xyz);
+    float roughness = clamp(normal_roughness.w, 0.02, 1.0);
+
+    // Reconstruct world position from G-buffer depth + inv_view_proj (no redundant primary ray!)
+    vec4 wp = pc.params.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec3 world_pos = wp.xyz / wp.w;
+    vec3 V = normalize(pc.params.cam_pos_range.xyz - world_pos);
+    float ndotv = max(dot(N, V), 0.001);
+
+    uint frame_idx = uint(pc.params.jitter_frame.z);
+    uint seed = uint(texel.x * 1973 + texel.y * 9277) ^ (frame_idx * 26699u + 1u);
+
+    // Material factors for demodulation (NRD_MaterialFactors style)
+    vec3 diff_albedo = albedo * (1.0 - metallic);
+    vec3 diff_factor = max(diff_albedo, vec3(0.03));
+
+    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
+    vec3 spec_factor = max(fresnel, vec3(0.03));
+
+    // Direct diffuse lighting at primary hit
+    vec3 direct_diff = eval_direct_lights(world_pos, N, diff_albedo, denoising_range);
+
+    int spp = max(int(pc.params.jitter_frame.w + 0.5), 1);
+    vec3 diff_accum = vec3(0.0);
+    vec3 spec_accum = vec3(0.0);
+    float diff_hit_accum = 0.0;
+    float spec_hit_accum = 0.0;
+
+    for (int s = 0; s < spp; ++s) {
+        // Secondary diffuse GI ray
+        vec3 diff_dir = sample_cosine_hemisphere(N, seed);
+        SecondaryHit dh = trace_secondary(world_pos + N * RAY_TMIN, diff_dir, sun_dir, sun_energy, denoising_range);
+        diff_accum += direct_diff + diff_albedo * dh.radiance;
+        diff_hit_accum += dh.hit_dist;
+
+        // Secondary specular reflection ray
+        vec3 refl = reflect(-V, N);
+        vec3 spec_dir = normalize(mix(refl, sample_cosine_hemisphere(N, seed), roughness * roughness));
+        if (dot(spec_dir, N) <= 0.0) {
+            spec_dir = refl;
+        }
+        SecondaryHit sh = trace_secondary(world_pos + N * RAY_TMIN, spec_dir, sun_dir, sun_energy, denoising_range);
+        spec_accum += fresnel * sh.radiance;
+        spec_hit_accum += sh.hit_dist;
+    }
+
+    diff_accum /= float(spp);
+    spec_accum /= float(spp);
+    float diff_hit_dist = diff_hit_accum / float(spp);
+    float spec_hit_dist = spec_hit_accum / float(spp);
+
+    // Demodulate radiance before NRD packing
+    vec3 demod_diff = diff_accum / diff_factor;
+    vec3 demod_spec = spec_accum / spec_factor;
+
+    // Normalize secondary bounce hit distances
+    float norm_diff_hit = nrd_get_norm_hit_dist(diff_hit_dist, view_z, 1.0);
+    float norm_spec_hit = nrd_get_norm_hit_dist(spec_hit_dist, view_z, roughness);
+
+    // Confidence masks (firefly suppression + grazing angle)
+    float diff_lum = dot(demod_diff, vec3(0.2126, 0.7152, 0.0722));
+    float spec_lum = dot(demod_spec, vec3(0.2126, 0.7152, 0.0722));
+    float diff_conf = clamp(1.0 / (1.0 + max(diff_lum - 8.0, 0.0) * 0.1), 0.15, 1.0);
+    float spec_conf = clamp(ndotv * 1.5, 0.2, 1.0) * clamp(1.0 / (1.0 + max(spec_lum - 8.0, 0.0) * 0.1), 0.15, 1.0);
+
+    imageStore(out_nrd_view_z, texel, vec4(view_z, 0.0, 0.0, 0.0));
+    imageStore(out_nrd_normal_roughness, texel, vec4(nrd_encode_normal_roughness(N, roughness), 0.0));
+    imageStore(out_nrd_diff_rad_hitdist, texel, vec4(nrd_linear_to_ycocg(demod_diff), norm_diff_hit));
+    imageStore(out_nrd_spec_rad_hitdist, texel, vec4(nrd_linear_to_ycocg(demod_spec), norm_spec_hit));
+    imageStore(out_nrd_diff_confidence, texel, vec4(diff_conf));
+    imageStore(out_nrd_spec_confidence, texel, vec4(spec_conf));
+}

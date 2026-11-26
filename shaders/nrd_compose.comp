@@ -1,0 +1,89 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer RtParamsBuf {
+    mat4 inv_view;
+    mat4 inv_proj;
+    mat4 inv_view_proj;
+    vec4 cam_pos_range;
+    vec4 jitter_frame;
+    uvec2 screen_size;
+    uint light_count;
+    uint _pad;
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    RtParamsBuf params;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D in_nrd_diff;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D in_nrd_spec;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D in_raw_sky;
+layout(set = 0, binding = 3) uniform sampler2D gbuf_albedo_metallic;
+layout(set = 0, binding = 4) uniform sampler2D gbuf_normal_roughness;
+layout(set = 0, binding = 5) uniform sampler2D gbuf_view_z;
+layout(set = 0, binding = 6) uniform sampler2D gbuf_depth;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D out_hdr;
+
+vec3 ycocg_to_rgb(vec3 c) {
+    return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 size = pc.params.screen_size;
+    bool in_bounds = texel.x < int(size.x) && texel.y < int(size.y);
+
+    float view_z = 0.0;
+    float depth = 0.0;
+    if (in_bounds) {
+        view_z = texelFetch(gbuf_view_z, texel, 0).r;
+        depth = texelFetch(gbuf_depth, texel, 0).r;
+    }
+    float denoising_range = pc.params.cam_pos_range.w;
+    bool is_sky = !in_bounds || view_z <= 0.0 || depth <= 0.0 || view_z >= denoising_range;
+
+    // Coherent subgroup fast-path for pure-sky regions
+    if (subgroupAll(is_sky)) {
+        if (in_bounds) {
+            vec3 sky_rgb = ycocg_to_rgb(imageLoad(in_raw_sky, texel).rgb);
+            imageStore(out_hdr, texel, vec4(max(sky_rgb, vec3(0.0)), 1.0));
+        }
+        return;
+    }
+    if (!in_bounds) {
+        return;
+    }
+
+    vec3 rgb;
+    if (is_sky) {
+        rgb = ycocg_to_rgb(imageLoad(in_raw_sky, texel).rgb);
+    } else {
+        vec4 albedo_metallic = texelFetch(gbuf_albedo_metallic, texel, 0);
+        vec4 normal_roughness = texelFetch(gbuf_normal_roughness, texel, 0);
+        vec3 albedo = albedo_metallic.rgb;
+        float metallic = albedo_metallic.a;
+        vec3 N = normalize(normal_roughness.xyz);
+
+        vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+        vec4 wp = pc.params.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+        vec3 world_pos = wp.xyz / wp.w;
+        vec3 V = normalize(pc.params.cam_pos_range.xyz - world_pos);
+        float ndotv = max(dot(N, V), 0.001);
+
+        vec3 diff_factor = max(albedo * (1.0 - metallic), vec3(0.03));
+        vec3 f0 = mix(vec3(0.04), albedo, metallic);
+        vec3 fresnel = f0 + (1.0 - f0) * pow(1.0 - ndotv, 5.0);
+        vec3 spec_factor = max(fresnel, vec3(0.03));
+
+        vec3 demod_diff = max(ycocg_to_rgb(imageLoad(in_nrd_diff, texel).rgb), vec3(0.0));
+        vec3 demod_spec = max(ycocg_to_rgb(imageLoad(in_nrd_spec, texel).rgb), vec3(0.0));
+        rgb = demod_diff * diff_factor + demod_spec * spec_factor;
+    }
+
+    imageStore(out_hdr, texel, vec4(max(rgb, vec3(0.0)), 1.0));
+}

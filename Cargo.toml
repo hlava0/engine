@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine-rhi",
+    "crates/engine-gpu-driven",
+    "crates/engine-rt-nrd",
+    "crates/engine-compute-ml",
+    "crates/engine-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+ash = "0.38"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+bytemuck = { version = "1.18", features = ["derive"] }
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
