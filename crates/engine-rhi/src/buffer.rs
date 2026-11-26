@@ -51,7 +51,9 @@ impl GpuBuffer {
             }
         };
 
-        if let Err(err) = unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset()) } {
+        if let Err(err) =
+            unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset()) }
+        {
             let _ = allocator.free(allocation);
             unsafe { device.destroy_buffer(buffer, None) };
             return Err(RhiError::Vk(err));

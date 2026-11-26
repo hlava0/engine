@@ -74,7 +74,10 @@ fn physics_gravity_ground_bounce_and_sphere_collision() {
         }
     }
     assert!(hit_ground, "Ball never reached the ground plane");
-    assert!(bounced_up, "Ball did not bounce upward after hitting ground");
+    assert!(
+        bounced_up,
+        "Ball did not bounce upward after hitting ground"
+    );
 
     // Sphere-vs-sphere head-on elastic collision
     let mut sphere_pw = PhysicsWorld::new();
@@ -139,8 +142,14 @@ fn audio_engine_headless_safe() {
 #[test]
 fn scene_editor_selection_and_nudge() {
     let mut game = GameWorld::new();
-    game.spawn((Name::new("First"), Transform::from_position([0.0, 0.0, 0.0])));
-    game.spawn((Name::new("Second"), Transform::from_position([5.0, 0.0, 0.0])));
+    game.spawn((
+        Name::new("First"),
+        Transform::from_position([0.0, 0.0, 0.0]),
+    ));
+    game.spawn((
+        Name::new("Second"),
+        Transform::from_position([5.0, 0.0, 0.0]),
+    ));
 
     let mut editor = SceneEditor::new();
     assert!(!editor.paused);
@@ -152,7 +161,10 @@ fn scene_editor_selection_and_nudge() {
 
     assert!(editor.nudge_selected(&mut game.world, [1.5, 0.0, -0.5]));
     let s0_after = editor.selected_summary(&game.world);
-    assert!(s0_after.contains("1.50"), "Expected nudged position, got {s0_after}");
+    assert!(
+        s0_after.contains("1.50"),
+        "Expected nudged position, got {s0_after}"
+    );
 
     editor.select_next(&game.world);
     let s1 = editor.selected_summary(&game.world);
@@ -211,8 +223,16 @@ fn rapier_box_box_trimesh_joint_and_raycast() {
 
     let ta = *game.world.get::<&Transform>(box_a).unwrap();
     let tb = *game.world.get::<&Transform>(box_b).unwrap();
-    assert!(ta.position[1] >= 0.4 && ta.position[1] < 1.2, "BoxA y={}", ta.position[1]);
-    assert!(tb.position[1] >= 0.4 && tb.position[1] < 1.5, "BoxB y={}", tb.position[1]);
+    assert!(
+        ta.position[1] >= 0.4 && ta.position[1] < 1.2,
+        "BoxA y={}",
+        ta.position[1]
+    );
+    assert!(
+        tb.position[1] >= 0.4 && tb.position[1] < 1.5,
+        "BoxB y={}",
+        tb.position[1]
+    );
 
     // Raycast downward from above BoxA
     let hit = pw.raycast([0.0, 5.0, 0.0], [0.0, -1.0, 0.0], 10.0);
@@ -234,7 +254,13 @@ fn rhai_velocity_impulse_and_spatial_audio_safe() {
     assert!((rb.velocity[1] - 5.0).abs() < 1e-4);
 
     let audio = AudioEngine::new();
-    audio.play_spatial_beep(440.0, 10, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, -3.0]);
+    audio.play_spatial_beep(
+        440.0,
+        10,
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [2.0, 0.0, -3.0],
+    );
     audio.play_impact(180.0, 20);
 }
 

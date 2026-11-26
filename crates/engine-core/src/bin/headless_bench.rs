@@ -125,6 +125,10 @@ fn main() {
         pixels.len(),
         engine.validation_errors()
     );
-    assert_eq!(engine.validation_errors(), 0, "Expected 0 validation errors");
+    assert_eq!(
+        engine.validation_errors(),
+        0,
+        "Expected 0 validation errors"
+    );
     assert!(non_zero > 0, "Expected non-zero rendered output");
 }

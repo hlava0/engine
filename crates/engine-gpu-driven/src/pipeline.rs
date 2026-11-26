@@ -712,8 +712,7 @@ fn create_compute_pipeline(
         .required_compute_subgroup_size
         .filter(|&sz| workgroup_size.is_multiple_of(sz));
     let mut sg_info = rhi.subgroup_stage_create_info(vk::ShaderStageFlags::COMPUTE, req_sg);
-    let stage_flags =
-        rhi.subgroup_stage_flags(vk::ShaderStageFlags::COMPUTE, req_sg, local_size_x);
+    let stage_flags = rhi.subgroup_stage_flags(vk::ShaderStageFlags::COMPUTE, req_sg, local_size_x);
 
     let mut stage = vk::PipelineShaderStageCreateInfo::default()
         .flags(stage_flags)
@@ -748,10 +747,16 @@ fn create_gbuffer_pipeline(
     let frag_words = load_shader_words("gbuffer.frag")?;
 
     let vert_module = unsafe {
-        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_words), None)?
+        device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&vert_words),
+            None,
+        )?
     };
     let frag_module = match unsafe {
-        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_words), None)
+        device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&frag_words),
+            None,
+        )
     } {
         Ok(m) => m,
         Err(err) => {
@@ -842,8 +847,7 @@ fn create_gbuffer_pipeline(
         .layout(layout)
         .push_next(&mut rendering_info)];
 
-    let pipe_res =
-        unsafe { device.create_graphics_pipelines(rhi.pipeline_cache, &gfx_info, None) };
+    let pipe_res = unsafe { device.create_graphics_pipelines(rhi.pipeline_cache, &gfx_info, None) };
     unsafe {
         device.destroy_shader_module(vert_module, None);
         device.destroy_shader_module(frag_module, None);

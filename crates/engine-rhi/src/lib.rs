@@ -48,7 +48,10 @@ pub fn load_shader_words(name: &str) -> Result<Vec<u32>> {
 
 /// Convert raw SPIR-V bytes (must be 4-byte aligned in length) into `Vec<u32>`.
 pub fn spirv_bytes_to_words(bytes: &[u8]) -> Vec<u32> {
-    assert!(bytes.len().is_multiple_of(4), "SPIR-V byte length must be a multiple of 4");
+    assert!(
+        bytes.len().is_multiple_of(4),
+        "SPIR-V byte length must be a multiple of 4"
+    );
     bytes
         .as_chunks::<4>()
         .0

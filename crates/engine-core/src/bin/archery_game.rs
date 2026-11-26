@@ -170,7 +170,9 @@ struct TargetState {
 }
 
 fn orient_arrow_matrix(pos: [f32; 3], dir: [f32; 3]) -> [[f32; 4]; 4] {
-    let dlen = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-5);
+    let dlen = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2])
+        .sqrt()
+        .max(1e-5);
     let f = [dir[0] / dlen, dir[1] / dlen, dir[2] / dlen];
     let world_up = if f[1].abs() > 0.96 {
         [1.0, 0.0, 0.0]
@@ -387,7 +389,13 @@ fn build_archery_scene(
         materials,
         instances,
         lights,
-        camera: CameraState::new([0.0, FLOOR_Y + EYE_HEIGHT, 6.5], [0.0, 0.5, -6.0], 65.0, width, height),
+        camera: CameraState::new(
+            [0.0, FLOOR_Y + EYE_HEIGHT, 6.5],
+            [0.0, 0.5, -6.0],
+            65.0,
+            width,
+            height,
+        ),
         time: 0.0,
         dirty_instances: true,
     };
@@ -607,7 +615,8 @@ impl ArcheryApp {
                 let s = (self.sim_time * tgt.freq + tgt.phase).sin();
                 tgt.pos = [
                     tgt.base_pos[0] + s * tgt.amp_x,
-                    tgt.base_pos[1] + (self.sim_time * tgt.freq * 1.4 + tgt.phase).cos() * tgt.amp_y,
+                    tgt.base_pos[1]
+                        + (self.sim_time * tgt.freq * 1.4 + tgt.phase).cos() * tgt.amp_y,
                     tgt.base_pos[2],
                 ];
             }
@@ -736,10 +745,7 @@ impl ApplicationHandler for ArcheryApp {
                 .expect("failed to create window"),
         );
         let phys = window.inner_size();
-        let display_handle = window
-            .display_handle()
-            .expect("display handle")
-            .as_raw();
+        let display_handle = window.display_handle().expect("display handle").as_raw();
         let window_handle = window.window_handle().expect("window handle").as_raw();
 
         let (scene, targets, arrows, game) =
@@ -872,9 +878,9 @@ impl ApplicationHandler for ArcheryApp {
                                     KeyCode::ArrowLeft | KeyCode::KeyA if self.menu_open => {
                                         self.adjust_menu(-1);
                                     }
-                                    KeyCode::ArrowRight
-                                    | KeyCode::KeyD
-                                    | KeyCode::Enter if self.menu_open => {
+                                    KeyCode::ArrowRight | KeyCode::KeyD | KeyCode::Enter
+                                        if self.menu_open =>
+                                    {
                                         self.adjust_menu(1);
                                     }
                                     _ => {}
@@ -914,8 +920,7 @@ impl ApplicationHandler for ArcheryApp {
                     match res {
                         Ok((stats, needs_recreate)) => {
                             if !stats.gpu_timings.is_empty() {
-                                self.last_gpu_ms =
-                                    stats.gpu_timings.iter().map(|t| t.gpu_ms).sum();
+                                self.last_gpu_ms = stats.gpu_timings.iter().map(|t| t.gpu_ms).sum();
                             }
                             if needs_recreate && let Some(win) = self.window.as_ref() {
                                 let sz = win.inner_size();
@@ -931,7 +936,8 @@ impl ApplicationHandler for ArcheryApp {
 
                 if self.last_title_update.elapsed().as_secs_f32() >= 0.25 {
                     self.last_title_update = Instant::now();
-                    if let (Some(win), Some(engine)) = (self.window.as_ref(), self.engine.as_ref()) {
+                    if let (Some(win), Some(engine)) = (self.window.as_ref(), self.engine.as_ref())
+                    {
                         let st = self.pacer.stats();
                         win.set_title(&format!(
                             "Archery Range | Score: {} | {:.0} FPS | GPU {:.2}ms | {} | [Click] Aim [LMB/F] Shoot [M] Menu",
@@ -957,7 +963,9 @@ impl ApplicationHandler for ArcheryApp {
 fn main() {
     let enable_validation = std::env::args().any(|a| a == "--validation");
     println!("Launching Vulkan 1.4 Archery Range...");
-    println!("Controls: WASD walk | Space jump | Shift sprint | Click window to lock mouse | Hold LMB/F to draw bow & shoot | M = Graphics Menu");
+    println!(
+        "Controls: WASD walk | Space jump | Shift sprint | Click window to lock mouse | Hold LMB/F to draw bow & shoot | M = Graphics Menu"
+    );
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);

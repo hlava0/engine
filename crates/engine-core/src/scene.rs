@@ -201,7 +201,8 @@ impl SceneWorld {
             for c in 0..3 {
                 scene_center[c] += pos[c];
             }
-            max_extent = max_extent.max(bs[3] * max_s + (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt());
+            max_extent = max_extent
+                .max(bs[3] * max_s + (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt());
 
             instances.push(InstanceDesc {
                 transform: t,
@@ -245,7 +246,11 @@ impl SceneWorld {
                 range: 1000.0,
             },
             LightDesc {
-                pos: [scene_center[0] - 3.0, scene_center[1] + 4.0, scene_center[2] + 3.0],
+                pos: [
+                    scene_center[0] - 3.0,
+                    scene_center[1] + 4.0,
+                    scene_center[2] + 3.0,
+                ],
                 energy: 8.0,
                 dir: [0.0, -1.0, 0.0],
                 is_point: true,
@@ -298,10 +303,8 @@ impl SceneWorld {
                 let phase = self.time * 1.5 + idx as f32 * 0.7;
                 let bob_y = inst.base_pos[1] + 0.25 * phase.sin();
                 let shift_x = inst.base_pos[0] + 0.35 * (phase * 0.7).cos();
-                inst.transform = mat4_translation_scale(
-                    [shift_x, bob_y, inst.base_pos[2]],
-                    inst.base_scale,
-                );
+                inst.transform =
+                    mat4_translation_scale([shift_x, bob_y, inst.base_pos[2]], inst.base_scale);
                 any_animated = true;
             }
         }
@@ -374,17 +377,19 @@ impl SceneWorld {
             .iter()
             .map(|l| GpuRtLight {
                 pos_energy: [l.pos[0], l.pos[1], l.pos[2], l.energy],
-                dir_type: [l.dir[0], l.dir[1], l.dir[2], if l.is_point { 1.0 } else { 0.0 }],
+                dir_type: [
+                    l.dir[0],
+                    l.dir[1],
+                    l.dir[2],
+                    if l.is_point { 1.0 } else { 0.0 },
+                ],
                 color_range: [l.color[0], l.color[1], l.color[2], l.range],
             })
             .collect()
     }
 
     /// Allocate and upload initial `GpuScene` buffers.
-    pub fn build_gpu_scene(
-        &self,
-        rhi: &mut RhiDevice,
-    ) -> Result<GpuScene, engine_rhi::RhiError> {
+    pub fn build_gpu_scene(&self, rhi: &mut RhiDevice) -> Result<GpuScene, engine_rhi::RhiError> {
         let (vertices, indices, meshes) = self.flatten_geometry();
         let instances = self.gpu_instances();
         GpuScene::new(rhi, &vertices, &indices, &meshes, &instances)
@@ -431,7 +436,8 @@ impl SceneWorld {
                     bytes.len() as vk::DeviceSize,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::VERTEX_SHADER,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::VERTEX_SHADER,
                     vk::AccessFlags2::SHADER_STORAGE_READ,
                 )];
                 unsafe { sync::cmd_pipeline_barrier2(device, cmd, &[], &barriers, &[]) };
@@ -462,12 +468,60 @@ impl SceneWorld {
 /// Build a unit cube mesh centered at the origin (`[-0.5, 0.5]^3`).
 pub fn create_cube_mesh() -> MeshDesc {
     let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
-        ([0.0, 0.0, 1.0], [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]]),
-        ([0.0, 0.0, -1.0], [[0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]]),
-        ([1.0, 0.0, 0.0], [[0.5, -0.5, 0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5]]),
-        ([-1.0, 0.0, 0.0], [[-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5]]),
-        ([0.0, 1.0, 0.0], [[-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]]),
-        ([0.0, -1.0, 0.0], [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]]),
+        (
+            [0.0, 0.0, 1.0],
+            [
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [0.0, 0.0, -1.0],
+            [
+                [0.5, -0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [1.0, 0.0, 0.0],
+            [
+                [0.5, -0.5, 0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [-1.0, 0.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [0.0, 1.0, 0.0],
+            [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+        ),
     ];
     let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(24);
@@ -490,10 +544,26 @@ pub fn create_cube_mesh() -> MeshDesc {
 pub fn create_plane_mesh() -> MeshDesc {
     let normal = [0.0, 1.0, 0.0];
     let vertices = vec![
-        GpuVertex { pos: [-0.5, 0.0, 0.5], normal, uv: [0.0, 0.0] },
-        GpuVertex { pos: [0.5, 0.0, 0.5], normal, uv: [1.0, 0.0] },
-        GpuVertex { pos: [0.5, 0.0, -0.5], normal, uv: [1.0, 1.0] },
-        GpuVertex { pos: [-0.5, 0.0, -0.5], normal, uv: [0.0, 1.0] },
+        GpuVertex {
+            pos: [-0.5, 0.0, 0.5],
+            normal,
+            uv: [0.0, 0.0],
+        },
+        GpuVertex {
+            pos: [0.5, 0.0, 0.5],
+            normal,
+            uv: [1.0, 0.0],
+        },
+        GpuVertex {
+            pos: [0.5, 0.0, -0.5],
+            normal,
+            uv: [1.0, 1.0],
+        },
+        GpuVertex {
+            pos: [-0.5, 0.0, -0.5],
+            normal,
+            uv: [0.0, 1.0],
+        },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];
     MeshDesc {
@@ -555,34 +625,65 @@ pub fn create_demo_scene(width: u32, height: u32) -> SceneWorld {
 
     let materials = vec![
         // 0: matte concrete floor
-        MaterialDesc { albedo: [0.65, 0.65, 0.68], roughness: 0.8, metallic: 0.0, emission: [0.0; 3] },
+        MaterialDesc {
+            albedo: [0.65, 0.65, 0.68],
+            roughness: 0.8,
+            metallic: 0.0,
+            emission: [0.0; 3],
+        },
         // 1: occluder wall
-        MaterialDesc { albedo: [0.35, 0.38, 0.42], roughness: 0.7, metallic: 0.0, emission: [0.0; 3] },
+        MaterialDesc {
+            albedo: [0.35, 0.38, 0.42],
+            roughness: 0.7,
+            metallic: 0.0,
+            emission: [0.0; 3],
+        },
         // 2: brushed gold metal
-        MaterialDesc { albedo: [0.95, 0.78, 0.35], roughness: 0.18, metallic: 0.95, emission: [0.0; 3] },
+        MaterialDesc {
+            albedo: [0.95, 0.78, 0.35],
+            roughness: 0.18,
+            metallic: 0.95,
+            emission: [0.0; 3],
+        },
         // 3: chrome mirror sphere
-        MaterialDesc { albedo: [0.92, 0.94, 0.96], roughness: 0.08, metallic: 1.0, emission: [0.0; 3] },
+        MaterialDesc {
+            albedo: [0.92, 0.94, 0.96],
+            roughness: 0.08,
+            metallic: 1.0,
+            emission: [0.0; 3],
+        },
         // 4: terracotta diffuse cube
-        MaterialDesc { albedo: [0.85, 0.32, 0.22], roughness: 0.55, metallic: 0.0, emission: [0.0; 3] },
+        MaterialDesc {
+            albedo: [0.85, 0.32, 0.22],
+            roughness: 0.55,
+            metallic: 0.0,
+            emission: [0.0; 3],
+        },
         // 5: warm emissive beacon
-        MaterialDesc { albedo: [1.0, 0.7, 0.3], roughness: 0.3, metallic: 0.0, emission: [3.5, 2.2, 0.8] },
+        MaterialDesc {
+            albedo: [1.0, 0.7, 0.3],
+            roughness: 0.3,
+            metallic: 0.0,
+            emission: [3.5, 2.2, 0.8],
+        },
     ];
 
-    let make_inst = |pos: [f32; 3], scale: [f32; 3], mesh_id: u32, material_id: u32, animated: bool| {
-        let m = mat4_translation_scale(pos, scale);
-        let max_s = scale[0].max(scale[1]).max(scale[2]);
-        let r = meshes[mesh_id as usize].bounding_sphere[3] * max_s;
-        InstanceDesc {
-            transform: m,
-            prev_transform: m,
-            bounding_sphere: [0.0, 0.0, 0.0, r],
-            mesh_id,
-            material_id,
-            animated,
-            base_pos: pos,
-            base_scale: scale,
-        }
-    };
+    let make_inst =
+        |pos: [f32; 3], scale: [f32; 3], mesh_id: u32, material_id: u32, animated: bool| {
+            let m = mat4_translation_scale(pos, scale);
+            let max_s = scale[0].max(scale[1]).max(scale[2]);
+            let r = meshes[mesh_id as usize].bounding_sphere[3] * max_s;
+            InstanceDesc {
+                transform: m,
+                prev_transform: m,
+                bounding_sphere: [0.0, 0.0, 0.0, r],
+                mesh_id,
+                material_id,
+                animated,
+                base_pos: pos,
+                base_scale: scale,
+            }
+        };
 
     let instances = vec![
         // Ground plane
@@ -646,28 +747,74 @@ pub fn create_demo_scene(width: u32, height: u32) -> SceneWorld {
 /// 4x4 matrix inverse (column-major).
 pub fn mat4_inverse(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let a = [
-        m[0][0], m[0][1], m[0][2], m[0][3],
-        m[1][0], m[1][1], m[1][2], m[1][3],
-        m[2][0], m[2][1], m[2][2], m[2][3],
-        m[3][0], m[3][1], m[3][2], m[3][3],
+        m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1],
+        m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3],
     ];
     let mut inv = [0.0f32; 16];
-    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
-    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
-    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
-    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
-    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
-    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
-    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
-    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
-    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
-    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
-    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
-    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
-    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
-    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
-    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
-    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15]
+        + a[9] * a[7] * a[14]
+        + a[13] * a[6] * a[11]
+        - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15]
+        - a[8] * a[7] * a[14]
+        - a[12] * a[6] * a[11]
+        + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15]
+        + a[8] * a[7] * a[13]
+        + a[12] * a[5] * a[11]
+        - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14]
+        - a[8] * a[6] * a[13]
+        - a[12] * a[5] * a[10]
+        + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15]
+        - a[9] * a[3] * a[14]
+        - a[13] * a[2] * a[11]
+        + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15]
+        + a[8] * a[3] * a[14]
+        + a[12] * a[2] * a[11]
+        - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15]
+        - a[8] * a[3] * a[13]
+        - a[12] * a[1] * a[11]
+        + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14]
+        + a[8] * a[2] * a[13]
+        + a[12] * a[1] * a[10]
+        - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15]
+        + a[5] * a[3] * a[14]
+        + a[13] * a[2] * a[7]
+        - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15]
+        - a[4] * a[3] * a[14]
+        - a[12] * a[2] * a[7]
+        + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15]
+        + a[4] * a[3] * a[13]
+        + a[12] * a[1] * a[7]
+        - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14]
+        - a[4] * a[2] * a[13]
+        - a[12] * a[1] * a[6]
+        + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11]
+        - a[5] * a[3] * a[10]
+        - a[9] * a[2] * a[7]
+        + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11]
+        + a[4] * a[3] * a[10]
+        + a[8] * a[2] * a[7]
+        - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11]
+        - a[4] * a[3] * a[9]
+        - a[8] * a[1] * a[7]
+        + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10]
+        + a[4] * a[2] * a[9]
+        + a[8] * a[1] * a[6]
+        - a[8] * a[2] * a[5];
 
     let det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
     if det.abs() < 1e-12 {

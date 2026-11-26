@@ -53,45 +53,75 @@ fn unit_cube_mesh() -> (Vec<GpuVertex>, Vec<u32>, GpuMeshDrawInfo) {
 
 fn mat4_inverse(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let a: [f32; 16] = [
-        m[0][0], m[0][1], m[0][2], m[0][3],
-        m[1][0], m[1][1], m[1][2], m[1][3],
-        m[2][0], m[2][1], m[2][2], m[2][3],
-        m[3][0], m[3][1], m[3][2], m[3][3],
+        m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1],
+        m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3],
     ];
     let mut inv = [0.0f32; 16];
 
     inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15]
-        + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+        + a[9] * a[7] * a[14]
+        + a[13] * a[6] * a[11]
+        - a[13] * a[7] * a[10];
     inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15]
-        - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+        - a[8] * a[7] * a[14]
+        - a[12] * a[6] * a[11]
+        + a[12] * a[7] * a[10];
     inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15]
-        + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+        + a[8] * a[7] * a[13]
+        + a[12] * a[5] * a[11]
+        - a[12] * a[7] * a[9];
     inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14]
-        - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+        - a[8] * a[6] * a[13]
+        - a[12] * a[5] * a[10]
+        + a[12] * a[6] * a[9];
     inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15]
-        - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+        - a[9] * a[3] * a[14]
+        - a[13] * a[2] * a[11]
+        + a[13] * a[3] * a[10];
     inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15]
-        + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+        + a[8] * a[3] * a[14]
+        + a[12] * a[2] * a[11]
+        - a[12] * a[3] * a[10];
     inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15]
-        - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+        - a[8] * a[3] * a[13]
+        - a[12] * a[1] * a[11]
+        + a[12] * a[3] * a[9];
     inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14]
-        + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+        + a[8] * a[2] * a[13]
+        + a[12] * a[1] * a[10]
+        - a[12] * a[2] * a[9];
     inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15]
-        + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+        + a[5] * a[3] * a[14]
+        + a[13] * a[2] * a[7]
+        - a[13] * a[3] * a[6];
     inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15]
-        - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+        - a[4] * a[3] * a[14]
+        - a[12] * a[2] * a[7]
+        + a[12] * a[3] * a[6];
     inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15]
-        + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+        + a[4] * a[3] * a[13]
+        + a[12] * a[1] * a[7]
+        - a[12] * a[3] * a[5];
     inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14]
-        - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+        - a[4] * a[2] * a[13]
+        - a[12] * a[1] * a[6]
+        + a[12] * a[2] * a[5];
     inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11]
-        - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+        - a[5] * a[3] * a[10]
+        - a[9] * a[2] * a[7]
+        + a[9] * a[3] * a[6];
     inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11]
-        + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+        + a[4] * a[3] * a[10]
+        + a[8] * a[2] * a[7]
+        - a[8] * a[3] * a[6];
     inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11]
-        - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+        - a[4] * a[3] * a[9]
+        - a[8] * a[1] * a[7]
+        + a[8] * a[3] * a[5];
     inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10]
-        + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+        + a[4] * a[2] * a[9]
+        + a[8] * a[1] * a[6]
+        - a[8] * a[2] * a[5];
 
     let det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
     let inv_det = if det.abs() > 1e-12 { 1.0 / det } else { 0.0 };
@@ -143,7 +173,9 @@ fn run_rt_denoiser_test(mode: DenoiserMode) {
     .expect("Failed to initialize RhiDevice");
 
     if !rhi.capabilities.khr_acceleration_structure || !rhi.capabilities.khr_ray_query {
-        println!("Skipping RT+NRD test: device does not support KHR_acceleration_structure / KHR_ray_query");
+        println!(
+            "Skipping RT+NRD test: device does not support KHR_acceleration_structure / KHR_ray_query"
+        );
         return;
     }
 
@@ -305,7 +337,12 @@ fn run_rt_denoiser_test(mode: DenoiserMode) {
             view_proj,
             prev_view_proj: view_proj,
             frustum_planes,
-            jitter: [jx * 2.0, jy * 2.0, prev_jitter[0] * 2.0, prev_jitter[1] * 2.0],
+            jitter: [
+                jx * 2.0,
+                jy * 2.0,
+                prev_jitter[0] * 2.0,
+                prev_jitter[1] * 2.0,
+            ],
             screen_size: [WIDTH, HEIGHT],
             hiz_size: [WIDTH, HEIGHT],
         };
@@ -428,18 +465,35 @@ fn run_rt_denoiser_test(mode: DenoiserMode) {
         let r = f16_to_f32(px[0]);
         let g = f16_to_f32(px[1]);
         let b = f16_to_f32(px[2]);
-        assert!(r.is_finite() && g.is_finite() && b.is_finite(), "Non-finite HDR pixel: ({r}, {g}, {b})");
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite(),
+            "Non-finite HDR pixel: ({r}, {g}, {b})"
+        );
         let lum = r + g + b;
         if lum > 0.001 {
             non_zero_pixels += 1;
         }
         max_lum = max_lum.max(lum);
     }
-    println!("HDR output: {non_zero_pixels}/{} non-zero pixels, max RGB sum = {max_lum:.3}", (WIDTH * HEIGHT) as usize);
-    assert!(non_zero_pixels > 100, "Expected lit HDR pixels, got {non_zero_pixels}");
+    println!(
+        "HDR output: {non_zero_pixels}/{} non-zero pixels, max RGB sum = {max_lum:.3}",
+        (WIDTH * HEIGHT) as usize
+    );
+    assert!(
+        non_zero_pixels > 100,
+        "Expected lit HDR pixels, got {non_zero_pixels}"
+    );
 
-    assert_eq!(rhi.validation_errors(), 0, "Expected 0 Vulkan validation errors");
-    assert_eq!(rhi.validation_warnings(), 0, "Expected 0 Vulkan validation warnings");
+    assert_eq!(
+        rhi.validation_errors(),
+        0,
+        "Expected 0 Vulkan validation errors"
+    );
+    assert_eq!(
+        rhi.validation_warnings(),
+        0,
+        "Expected 0 Vulkan validation warnings"
+    );
 
     // Clean teardown
     rhi.wait_idle().expect("wait_idle");

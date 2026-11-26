@@ -105,6 +105,45 @@ fn hud_menu_overlay_and_settings_toggle_headless() {
 }
 
 #[test]
+fn decoupled_resolution_and_rapid_resize_validation() {
+    use engine_core::upscaler::FsrPreset;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    let world = create_demo_scene(192, 128);
+    let mut engine = Engine::new(world, 192, 128, true).expect("Engine::new");
+
+    // Switch to FSR Quality (~0.67x internal render resolution)
+    engine.graphics_settings.fsr_preset = FsrPreset::Quality;
+    for _ in 0..2 {
+        engine
+            .render_frame(1.0 / 60.0)
+            .expect("render_frame quality");
+    }
+    assert_eq!((engine.render_width, engine.render_height), (128, 85));
+    let q_pixels = engine.readback_output_rgba().expect("readback quality");
+    assert_eq!(q_pixels.len(), 192 * 128);
+
+    // Rapid resize sequence including 0x0 minimized no-op and FSR Performance (0.5x)
+    for (w, h) in [(256, 144), (160, 120), (0, 0), (320, 180)] {
+        engine.resize_swapchain(w, h).expect("resize_swapchain");
+        engine.graphics_settings.fsr_preset = FsrPreset::Performance;
+        engine
+            .render_frame(1.0 / 60.0)
+            .expect("render_frame resized");
+    }
+    assert_eq!((engine.width, engine.height), (320, 180));
+    assert_eq!((engine.render_width, engine.render_height), (160, 90));
+    let p_pixels = engine.readback_output_rgba().expect("readback perf");
+    assert_eq!(p_pixels.len(), 320 * 180);
+    assert!(
+        p_pixels
+            .iter()
+            .any(|p| p[0] > 0.01 || p[1] > 0.01 || p[2] > 0.01)
+    );
+    assert_eq!(engine.validation_errors(), 0);
+}
+
+#[test]
 fn fsr31_temporal_upscaler_two_frames_validation() {
     use engine_core::upscaler::{FsrPreset, TemporalUpscalerPass};
     use engine_rhi::ash::vk;
@@ -163,13 +202,17 @@ fn fsr31_temporal_upscaler_two_frames_validation() {
     .unwrap();
 
     let pool = rhi
-        .create_command_pool(rhi.queue_families.graphics, vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+        .create_command_pool(
+            rhi.queue_families.graphics,
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        )
         .unwrap();
     let cmd = rhi.allocate_command_buffer(pool).unwrap();
 
     for f in 0..2 {
         unsafe {
-            dev.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
+            dev.reset_command_pool(pool, vk::CommandPoolResetFlags::empty())
+                .unwrap();
             dev.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo::default()

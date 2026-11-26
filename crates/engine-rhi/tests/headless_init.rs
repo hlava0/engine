@@ -27,7 +27,10 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
     .expect("Failed to initialize RhiDevice");
 
     let caps = &rhi.capabilities;
-    println!("Selected GPU: {} ({:?})", caps.device_name, caps.device_type);
+    println!(
+        "Selected GPU: {} ({:?})",
+        caps.device_name, caps.device_type
+    );
     println!(
         "Vulkan API version: {}.{}.{}",
         vk::api_version_major(caps.api_version),
@@ -49,7 +52,14 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
     for (i, cm) in caps.cooperative_matrix_properties.iter().enumerate() {
         println!(
             "  CoopMatrix[{i}]: {}x{}x{} A={:?} B={:?} C={:?} R={:?} scope={:?}",
-            cm.m_size, cm.n_size, cm.k_size, cm.a_type, cm.b_type, cm.c_type, cm.result_type, cm.scope
+            cm.m_size,
+            cm.n_size,
+            cm.k_size,
+            cm.a_type,
+            cm.b_type,
+            cm.c_type,
+            cm.result_type,
+            cm.scope
         );
     }
 
@@ -85,10 +95,7 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
         .expect("Failed to allocate BDA GpuBuffer")
     };
     assert_ne!(bda_buf.device_address, 0);
-    bda_buf
-        .mapped_slice_mut()
-        .expect("mapped slice")
-        .fill(0);
+    bda_buf.mapped_slice_mut().expect("mapped slice").fill(0);
 
     // Load compiled SPIR-V compute shader from OUT_DIR
     let spv_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/noop.comp.spv"));
@@ -122,8 +129,8 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(rhi.queue_families.compute)
         .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-    let cmd_pool = unsafe { rhi.device.create_command_pool(&pool_info, None) }
-        .expect("create_command_pool");
+    let cmd_pool =
+        unsafe { rhi.device.create_command_pool(&pool_info, None) }.expect("create_command_pool");
 
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(cmd_pool)
@@ -201,7 +208,11 @@ fn headless_vulkan14_init_and_compute_bda_sync2() {
     }
     bindless.destroy(&rhi.device);
 
-    assert_eq!(rhi.validation_errors(), 0, "Expected 0 Vulkan validation errors");
+    assert_eq!(
+        rhi.validation_errors(),
+        0,
+        "Expected 0 Vulkan validation errors"
+    );
     assert_eq!(
         rhi.validation_warnings(),
         0,
@@ -258,8 +269,13 @@ fn async_transfer_and_compute_timeline_queues() {
         .submit_compute(&rhi, Some(t_ticket), |_d, _cmd| Ok(()))
         .expect("submit_compute");
 
-    async_q.wait_compute_cpu(&rhi, c_ticket).expect("wait_compute_cpu");
-    assert_eq!(&dst.allocation.as_ref().unwrap().mapped_slice().unwrap()[..4], &[1, 2, 3, 4]);
+    async_q
+        .wait_compute_cpu(&rhi, c_ticket)
+        .expect("wait_compute_cpu");
+    assert_eq!(
+        &dst.allocation.as_ref().unwrap().mapped_slice().unwrap()[..4],
+        &[1, 2, 3, 4]
+    );
 
     unsafe { rhi.device.device_wait_idle().unwrap() };
     async_q.destroy(&rhi);

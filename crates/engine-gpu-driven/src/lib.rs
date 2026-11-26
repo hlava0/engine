@@ -9,7 +9,7 @@ pub use pipeline::{GBufferTargets, GpuDrivenPipeline};
 pub use scene::GpuScene;
 pub use skinning::{ComputeSkinningPass, GpuSkinWeight, SkinningPushConstants};
 pub use types::{
-    CULL_FLAG_FRUSTUM, CULL_FLAG_HIZ, CullPushConstants, DrawIndexedIndirectCommand,
-    FrameUniforms, GeomPushConstants, GpuInstanceData, GpuMaterialTextures, GpuMeshDrawInfo,
-    GpuVertex, HizDownsamplePushConstants,
+    CULL_FLAG_FRUSTUM, CULL_FLAG_HIZ, CullPushConstants, DrawIndexedIndirectCommand, FrameUniforms,
+    GeomPushConstants, GpuInstanceData, GpuMaterialTextures, GpuMeshDrawInfo, GpuVertex,
+    HizDownsamplePushConstants,
 };

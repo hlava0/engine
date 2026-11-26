@@ -182,10 +182,8 @@ impl ViewerApp {
         }
 
         // Ground plane at y = -1.0 (matches floor instance 0)
-        self.game.spawn((
-            Name::new("GroundPlane"),
-            Collider::GroundPlane { y: -1.0 },
-        ));
+        self.game
+            .spawn((Name::new("GroundPlane"), Collider::GroundPlane { y: -1.0 }));
 
         // Bouncing gold sphere (instance 4)
         if scene.instances.len() > 4 {
@@ -249,7 +247,11 @@ impl ViewerApp {
 
     fn populate_gltf_gameplay(&mut self, scene: &SceneWorld) {
         for (idx, inst) in scene.instances.iter().enumerate() {
-            let pos = [inst.transform[3][0], inst.transform[3][1], inst.transform[3][2]];
+            let pos = [
+                inst.transform[3][0],
+                inst.transform[3][1],
+                inst.transform[3][2],
+            ];
             self.game.spawn((
                 Name::new(format!("GltfInstance#{idx}")),
                 Transform::from_position_scale(pos, inst.base_scale),
@@ -296,14 +298,8 @@ impl ApplicationHandler for ViewerApp {
         self.camera = FreeFlyCamera::from_scene(&scene);
         scene.sync_from_game_world(&self.game);
 
-        let display_handle = window
-            .display_handle()
-            .expect("display_handle")
-            .as_raw();
-        let window_handle = window
-            .window_handle()
-            .expect("window_handle")
-            .as_raw();
+        let display_handle = window.display_handle().expect("display_handle").as_raw();
+        let window_handle = window.window_handle().expect("window_handle").as_raw();
 
         let engine = Engine::new_with_window(
             scene,
@@ -400,16 +396,20 @@ impl ApplicationHandler for ViewerApp {
                                         self.audio.play_beep(520.0, 25);
                                     }
                                     KeyCode::KeyI => {
-                                        self.editor
-                                            .nudge_selected(&mut self.game.world, [0.0, 0.0, -0.25]);
+                                        self.editor.nudge_selected(
+                                            &mut self.game.world,
+                                            [0.0, 0.0, -0.25],
+                                        );
                                     }
                                     KeyCode::KeyK => {
                                         self.editor
                                             .nudge_selected(&mut self.game.world, [0.0, 0.0, 0.25]);
                                     }
                                     KeyCode::KeyJ => {
-                                        self.editor
-                                            .nudge_selected(&mut self.game.world, [-0.25, 0.0, 0.0]);
+                                        self.editor.nudge_selected(
+                                            &mut self.game.world,
+                                            [-0.25, 0.0, 0.0],
+                                        );
                                     }
                                     KeyCode::KeyL => {
                                         self.editor
@@ -467,12 +467,9 @@ impl ApplicationHandler for ViewerApp {
                     match engine.render_frame_to_swapchain_with_egui(dt_f32, ui_arg) {
                         Ok((stats, needs_recreate)) => {
                             if !stats.gpu_timings.is_empty() {
-                                self.last_gpu_ms =
-                                    stats.gpu_timings.iter().map(|t| t.gpu_ms).sum();
+                                self.last_gpu_ms = stats.gpu_timings.iter().map(|t| t.gpu_ms).sum();
                             }
-                            if needs_recreate
-                                && let Some(win) = self.window.as_ref()
-                            {
+                            if needs_recreate && let Some(win) = self.window.as_ref() {
                                 let sz = win.inner_size();
                                 let _ = engine.resize_swapchain(sz.width, sz.height);
                             }

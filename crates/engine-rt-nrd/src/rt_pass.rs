@@ -128,7 +128,11 @@ impl RtGiPass {
             params_vec.try_into().unwrap_or_else(|_| unreachable!());
 
         let default_mat = [GpuRtMaterial::default()];
-        let mat_slice = if materials.is_empty() { &default_mat } else { materials };
+        let mat_slice = if materials.is_empty() {
+            &default_mat
+        } else {
+            materials
+        };
         let mut materials_buffer = GpuBuffer::new(
             &device,
             rhi.allocator_mut(),
@@ -137,10 +141,12 @@ impl RtGiPass {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
         )?;
-        materials_buffer.mapped_slice_mut()?.copy_from_slice(cast_slice(mat_slice));
+        materials_buffer
+            .mapped_slice_mut()?
+            .copy_from_slice(cast_slice(mat_slice));
 
-        let res_bytes = (width as usize * height as usize).max(1)
-            * std::mem::size_of::<RestirReservoir>();
+        let res_bytes =
+            (width as usize * height as usize).max(1) * std::mem::size_of::<RestirReservoir>();
         let restir_reservoirs = [
             GpuBuffer::new(
                 &device,
@@ -161,7 +167,11 @@ impl RtGiPass {
         ];
 
         let default_light = [GpuRtLight::default()];
-        let light_slice = if lights.is_empty() { &default_light } else { lights };
+        let light_slice = if lights.is_empty() {
+            &default_light
+        } else {
+            lights
+        };
         let mut lights_buffer = GpuBuffer::new(
             &device,
             rhi.allocator_mut(),
@@ -170,7 +180,9 @@ impl RtGiPass {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
         )?;
-        lights_buffer.mapped_slice_mut()?.copy_from_slice(cast_slice(light_slice));
+        lights_buffer
+            .mapped_slice_mut()?
+            .copy_from_slice(cast_slice(light_slice));
 
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
@@ -283,7 +295,10 @@ impl RtGiPass {
 
         let shader_words = load_shader_words("rt_gi.comp")?;
         let module = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&shader_words), None)?
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&shader_words),
+                None,
+            )?
         };
         let req_sg = rhi
             .capabilities

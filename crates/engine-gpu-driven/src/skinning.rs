@@ -3,7 +3,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use engine_rhi::ash::vk;
-use engine_rhi::{RhiDevice, Result, load_shader_words, sync};
+use engine_rhi::{Result, RhiDevice, load_shader_words, sync};
 
 /// Per-vertex 4-bone skinning indices and weights (`32` bytes, `scalar` aligned).
 #[repr(C)]
@@ -65,12 +65,7 @@ impl ComputeSkinningPass {
         })
     }
 
-    pub fn dispatch(
-        &self,
-        rhi: &RhiDevice,
-        cmd: vk::CommandBuffer,
-        push: &SkinningPushConstants,
-    ) {
+    pub fn dispatch(&self, rhi: &RhiDevice, cmd: vk::CommandBuffer, push: &SkinningPushConstants) {
         if push.vertex_count == 0 {
             return;
         }
@@ -101,7 +96,8 @@ impl ComputeSkinningPass {
     pub fn destroy(self, rhi: &RhiDevice) {
         unsafe {
             rhi.device.destroy_pipeline(self.pipeline, None);
-            rhi.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            rhi.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }

@@ -203,7 +203,10 @@ fn headless_gpu_driven_frustum_and_hiz_cull() {
     // Frame 0: frustum cull only -> instances 0, 1, 2 pass (instance 3 culled)
     let count0 = run_frame(0, false);
     println!("Frame 0 (frustum only) draw_count = {count0}");
-    assert_eq!(count0, 3, "Expected 3 instances to pass frustum cull on Frame 0");
+    assert_eq!(
+        count0, 3,
+        "Expected 3 instances to pass frustum cull on Frame 0"
+    );
 
     // Frame 1: frustum + Hi-Z cull -> instances 0, 2 pass (instance 1 occluded, instance 3 frustum-culled)
     let count1 = run_frame(1, true);
@@ -320,7 +323,10 @@ fn compute_skinning_vulkan_validation() {
     .unwrap();
 
     let pool = rhi
-        .create_command_pool(rhi.queue_families.graphics, vk::CommandPoolCreateFlags::TRANSIENT)
+        .create_command_pool(
+            rhi.queue_families.graphics,
+            vk::CommandPoolCreateFlags::TRANSIENT,
+        )
         .unwrap();
     let cmd = rhi.allocate_command_buffer(pool).unwrap();
     unsafe {
@@ -348,7 +354,11 @@ fn compute_skinning_vulkan_validation() {
 
     let out_bytes = out_buf.allocation.as_ref().unwrap().mapped_slice().unwrap();
     let out_v: &GpuVertex = bytemuck::from_bytes(&out_bytes[..std::mem::size_of::<GpuVertex>()]);
-    assert!((out_v.pos[0] - 6.0).abs() < 1e-4, "Expected x=6.0, got {}", out_v.pos[0]);
+    assert!(
+        (out_v.pos[0] - 6.0).abs() < 1e-4,
+        "Expected x=6.0, got {}",
+        out_v.pos[0]
+    );
 
     unsafe { dev.destroy_command_pool(pool, None) };
     skin_pass.destroy(&rhi);

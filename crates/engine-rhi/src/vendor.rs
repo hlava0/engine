@@ -236,8 +236,7 @@ fn select_coop_matrix_tile(
 
 /// Detect Resizable BAR / Smart Access Memory (`DEVICE_LOCAL | HOST_VISIBLE` heap >= 256 MiB).
 pub fn detect_rebar(mem_props: &vk::PhysicalDeviceMemoryProperties) -> bool {
-    let required =
-        vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
+    let required = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
     let type_count = mem_props.memory_type_count as usize;
     let heap_count = mem_props.memory_heap_count as usize;
 

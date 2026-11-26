@@ -158,8 +158,8 @@ impl RhiDevice {
     pub fn new(config: RhiConfig) -> Result<Self> {
         let entry = unsafe { ash::Entry::load()? };
 
-        let instance_version = unsafe { entry.try_enumerate_instance_version()? }
-            .unwrap_or(vk::API_VERSION_1_0);
+        let instance_version =
+            unsafe { entry.try_enumerate_instance_version()? }.unwrap_or(vk::API_VERSION_1_0);
         if instance_version < API_VERSION_1_3 {
             return Err(RhiError::MissingCapability(format!(
                 "Vulkan 1.3 or newer is required (loader reports {}.{}.{})",
@@ -197,9 +197,9 @@ impl RhiDevice {
         let available_exts = unsafe { entry.enumerate_instance_extension_properties(None)? };
 
         let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
-        let has_validation_layer = available_layers.iter().any(|l| {
-            (unsafe { CStr::from_ptr(l.layer_name.as_ptr()) }) == validation_layer_name
-        });
+        let has_validation_layer = available_layers
+            .iter()
+            .any(|l| (unsafe { CStr::from_ptr(l.layer_name.as_ptr()) }) == validation_layer_name);
         let has_debug_utils = available_exts.iter().any(|e| {
             (unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }) == ash::ext::debug_utils::NAME
         });
@@ -509,7 +509,12 @@ fn select_physical_device(
         return Err(RhiError::NoSuitableDevice);
     }
 
-    let mut best: Option<(i32, vk::PhysicalDevice, DeviceCapabilities, QueueFamilyIndices)> = None;
+    let mut best: Option<(
+        i32,
+        vk::PhysicalDevice,
+        DeviceCapabilities,
+        QueueFamilyIndices,
+    )> = None;
 
     for pdev in devices {
         let Some(queues) = find_queue_families(instance, pdev) else {
@@ -544,7 +549,10 @@ fn select_physical_device(
             score += 200;
         }
 
-        if best.as_ref().is_none_or(|(best_score, _, _, _)| score > *best_score) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _, _, _)| score > *best_score)
+        {
             best = Some((score, pdev, caps, queues));
         }
     }
@@ -871,10 +879,10 @@ fn create_logical_device(
         .compute_full_subgroups(caps.compute_full_subgroups)
         .shader_demote_to_helper_invocation(true);
 
-    let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-        .acceleration_structure(true);
-    let mut rt_pipe_feat = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
-        .ray_tracing_pipeline(true);
+    let mut as_feat =
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
+    let mut rt_pipe_feat =
+        vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
     let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
     let mut rt_pos_feat = vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
         .ray_tracing_position_fetch(true);

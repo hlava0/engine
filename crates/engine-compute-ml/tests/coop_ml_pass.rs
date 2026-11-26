@@ -261,7 +261,10 @@ fn coop_ml_hardware_and_fallback_paths() {
 
     let (uses_coop_fb, fb_pixels) = run_coop_ml_test(true);
     println!("CoopML fallback path: uses_cooperative_matrix={uses_coop_fb}");
-    assert!(!uses_coop_fb, "Expected fallback path when force_fallback=true");
+    assert!(
+        !uses_coop_fb,
+        "Expected fallback path when force_fallback=true"
+    );
 
     let mut non_zero = 0usize;
     let mut max_diff = 0.0f32;

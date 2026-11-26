@@ -16,11 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (Vulkan headers, glslang-tools, ALSA)
+      - name: Install system dependencies (Vulkan headers, Lavapipe, glslang-tools, ALSA)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslang-tools libasound2-dev pkg-config
+            libvulkan-dev mesa-vulkan-drivers glslang-tools libasound2-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,15 +36,21 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check formatting (advisory)
-        continue-on-error: true
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets, -D warnings, SVGF fallback)
+      - name: Clippy (all targets, -D warnings, SVGF + GLSL fallback)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run CPU / unit tests (no hardware GPU required)
+      - name: Run CPU / unit tests
         run: |
           cargo test --workspace --lib
           cargo test -p engine-gameplay
           cargo test -p engine-assets glb_in_memory_roundtrip
+
+      - name: Run GPU integration tests via Mesa Lavapipe
+        run: |
+          ICD_FILE="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)"
+          export VK_ICD_FILENAMES="$ICD_FILE"
+          cargo test -p engine-rhi --test headless_init
+          cargo test -p engine-gpu-driven --test gpu_driven_pass

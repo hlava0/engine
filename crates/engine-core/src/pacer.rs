@@ -125,14 +125,18 @@ impl FramePacer {
         self.scratch_sorted.extend_from_slice(slice);
         self.scratch_sorted.sort_by(f64::total_cmp);
 
-        let p95_idx = ((n as f64 * 0.95).ceil() as usize).saturating_sub(1).min(n - 1);
-        let p99_idx = ((n as f64 * 0.99).ceil() as usize).saturating_sub(1).min(n - 1);
+        let p95_idx = ((n as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        let p99_idx = ((n as f64 * 0.99).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
         let p95_frame_ms = self.scratch_sorted[p95_idx];
         let p99_frame_ms = self.scratch_sorted[p99_idx];
 
         let slowest_count = (n / 100).max(1);
-        let slowest_avg_ms = self.scratch_sorted[n - slowest_count..].iter().sum::<f64>()
-            / slowest_count as f64;
+        let slowest_avg_ms =
+            self.scratch_sorted[n - slowest_count..].iter().sum::<f64>() / slowest_count as f64;
         let one_percent_low_fps = if slowest_avg_ms > 0.0 {
             1000.0 / slowest_avg_ms
         } else {

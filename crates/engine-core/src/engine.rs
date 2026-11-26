@@ -104,6 +104,10 @@ pub struct Engine {
     pub hud_state: HudOverlayState,
     pub width: u32,
     pub height: u32,
+    pub render_width: u32,
+    pub render_height: u32,
+    active_fsr_preset: FsrPreset,
+    active_upscaler_enabled: bool,
     frame_index: u32,
     has_hiz_history: bool,
 }
@@ -179,8 +183,16 @@ impl Engine {
         width: u32,
         height: u32,
     ) -> Result<Self, EngineError> {
+        let graphics_settings = GraphicsSettings::default();
+        let (render_w, render_h) = Self::compute_render_dimensions(
+            width,
+            height,
+            graphics_settings.enable_upscaler,
+            graphics_settings.fsr_preset,
+        );
+
         let bindless = BindlessTable::new(&rhi.device, BindlessConfig::default())?;
-        let gbuffer_pipe = GpuDrivenPipeline::new(&mut rhi, &bindless, width, height)?;
+        let gbuffer_pipe = GpuDrivenPipeline::new(&mut rhi, &bindless, render_w, render_h)?;
 
         let (vertices, _, meshes) = world.flatten_geometry();
         let gpu_instances_scratch = world.gpu_instances();
@@ -236,9 +248,9 @@ impl Engine {
 
         let materials = world.gpu_materials();
         let lights = world.gpu_lights();
-        let rt_pass = RtGiPass::new(&mut rhi, width, height, &materials, &lights)?;
-        let nrd = NrdDenoiser::new(&mut rhi, width, height)?;
-        let compose = NrdComposePass::new(&mut rhi, width, height)?;
+        let rt_pass = RtGiPass::new(&mut rhi, render_w, render_h, &materials, &lights)?;
+        let nrd = NrdDenoiser::new(&mut rhi, render_w, render_h)?;
+        let compose = NrdComposePass::new(&mut rhi, render_w, render_h)?;
 
         rt_pass.bind_resources(&rhi.device, &accel, &gbuffer_pipe.targets);
         compose.bind_resources(&rhi.device, &nrd, &rt_pass, &gbuffer_pipe.targets);
@@ -258,8 +270,8 @@ impl Engine {
         let output_image = GpuImage::create_2d(
             &dev,
             rhi.allocator_mut(),
-            width,
-            height,
+            render_w,
+            render_h,
             1,
             vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageUsageFlags::STORAGE
@@ -300,35 +312,153 @@ impl Engine {
             gpu_instances_scratch,
             graphics_settings: GraphicsSettings {
                 fov_deg: world.camera.fov_y_rad.to_degrees(),
-                ..Default::default()
+                ..graphics_settings
             },
             hud_state: HudOverlayState::default(),
             world,
             width,
             height,
+            render_width: render_w,
+            render_height: render_h,
+            active_fsr_preset: graphics_settings.fsr_preset,
+            active_upscaler_enabled: graphics_settings.enable_upscaler,
             frame_index: 0,
             has_hiz_history: false,
         })
     }
 
-    /// Recreate the window swapchain for a new `(width, height)`.
+    fn compute_render_dimensions(
+        display_w: u32,
+        display_h: u32,
+        enable_upscaler: bool,
+        preset: FsrPreset,
+    ) -> (u32, u32) {
+        if enable_upscaler {
+            preset.render_dimensions(display_w, display_h)
+        } else {
+            (display_w.max(16), display_h.max(16))
+        }
+    }
+
+    /// Recreate internal render-resolution targets (`gbuffer_pipe`, `rt_pass`, `nrd`, `compose`,
+    /// `output_image`) and display-resolution `TemporalUpscalerPass` for `(display_w, display_h)`.
+    pub fn recreate_resolution_targets(
+        &mut self,
+        display_w: u32,
+        display_h: u32,
+    ) -> Result<(), EngineError> {
+        let display_w = display_w.max(16);
+        let display_h = display_h.max(16);
+        let (render_w, render_h) = Self::compute_render_dimensions(
+            display_w,
+            display_h,
+            self.graphics_settings.enable_upscaler,
+            self.graphics_settings.fsr_preset,
+        );
+
+        self.wait_idle()?;
+        let dev = self.rhi.device.clone();
+
+        if let Some(img) = self.output_image.take() {
+            img.destroy(&dev, self.rhi.allocator_mut())?;
+        }
+        if let Some(up) = self.upscaler.take() {
+            up.destroy(&mut self.rhi)?;
+        }
+        if let Some(c) = self.compose.take() {
+            c.destroy(&mut self.rhi)?;
+        }
+        if let Some(n) = self.nrd.take() {
+            n.destroy(&mut self.rhi)?;
+        }
+        if let Some(rt) = self.rt_pass.take() {
+            rt.destroy(&mut self.rhi)?;
+        }
+        if let Some(g) = self.gbuffer_pipe.take() {
+            g.destroy(&mut self.rhi)?;
+        }
+
+        let bindless = self.bindless.as_ref().expect("bindless");
+        let gbuffer_pipe = GpuDrivenPipeline::new(&mut self.rhi, bindless, render_w, render_h)?;
+        let materials = self.world.gpu_materials();
+        let lights = self.world.gpu_lights();
+        let rt_pass = RtGiPass::new(&mut self.rhi, render_w, render_h, &materials, &lights)?;
+        let nrd = NrdDenoiser::new(&mut self.rhi, render_w, render_h)?;
+        let compose = NrdComposePass::new(&mut self.rhi, render_w, render_h)?;
+
+        let accel = self.accel.as_ref().expect("accel");
+        rt_pass.bind_resources(&self.rhi.device, accel, &gbuffer_pipe.targets);
+        compose.bind_resources(&self.rhi.device, &nrd, &rt_pass, &gbuffer_pipe.targets);
+
+        let upscaler = TemporalUpscalerPass::new(&mut self.rhi, display_w, display_h)?;
+        let output_image = GpuImage::create_2d(
+            &dev,
+            self.rhi.allocator_mut(),
+            render_w,
+            render_h,
+            1,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageAspectFlags::COLOR,
+            "engine_final_output",
+        )?;
+
+        let mut render_graph = RenderGraph::new();
+        let rg_out_id = render_graph.register_image(
+            "engine_final_output",
+            output_image.image,
+            output_image.subresource_range(),
+            vk::ImageLayout::UNDEFINED,
+        );
+
+        self.gbuffer_pipe = Some(gbuffer_pipe);
+        self.rt_pass = Some(rt_pass);
+        self.nrd = Some(nrd);
+        self.compose = Some(compose);
+        self.upscaler = Some(upscaler);
+        self.output_image = Some(output_image);
+        self.render_graph = render_graph;
+        self.rg_out_id = rg_out_id;
+        self.width = display_w;
+        self.height = display_h;
+        self.render_width = render_w;
+        self.render_height = render_h;
+        self.active_fsr_preset = self.graphics_settings.fsr_preset;
+        self.active_upscaler_enabled = self.graphics_settings.enable_upscaler;
+        self.has_hiz_history = false;
+        Ok(())
+    }
+
+    fn sync_render_resolution(&mut self) -> Result<(), EngineError> {
+        if self.graphics_settings.fsr_preset != self.active_fsr_preset
+            || self.graphics_settings.enable_upscaler != self.active_upscaler_enabled
+        {
+            self.recreate_resolution_targets(self.width, self.height)?;
+        }
+        Ok(())
+    }
+
+    /// Recreate the window swapchain and all resolution-dependent render/upscaler targets
+    /// for a new `(width, height)`.
     ///
     /// Gracefully ignores 0-sized (minimized) windows.
     pub fn resize_swapchain(&mut self, width: u32, height: u32) -> Result<(), EngineError> {
         if width == 0 || height == 0 {
             return Ok(());
         }
+        self.wait_idle()?;
         if let Some(sc) = self.swapchain.as_mut() {
             sc.recreate(&self.rhi, width, height)?;
         }
+        self.recreate_resolution_targets(width, height)?;
         Ok(())
     }
 
     /// Returns the active denoiser backend name (`"NVIDIA NRD (REBLUR)"` or `"Built-in SVGF (GPL-3.0)"`).
     pub fn denoiser_backend_name(&self) -> &'static str {
-        self.nrd
-            .as_ref()
-            .map_or("None", NrdDenoiser::backend_name)
+        self.nrd.as_ref().map_or("None", NrdDenoiser::backend_name)
     }
 
     /// Wait for all in-flight GPU work to finish.
@@ -372,6 +502,7 @@ impl Engine {
     /// its completed GPU timestamps & draw count without stalling, records frame `N`, and submits
     /// asynchronously via `vkQueueSubmit2`.
     pub fn render_frame(&mut self, dt: f32) -> Result<FrameStats, EngineError> {
+        self.sync_render_resolution()?;
         let frame_idx = self.frame_index;
         let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
         let is_first = frame_idx == 0;
@@ -434,7 +565,10 @@ impl Engine {
     ///
     /// Returns `Ok((stats, needs_recreate))`, where `needs_recreate` is `true` if the swapchain
     /// reported `SUBOPTIMAL_KHR` or `ERROR_OUT_OF_DATE_KHR` and should be resized via [`Engine::resize_swapchain`].
-    pub fn render_frame_to_swapchain(&mut self, dt: f32) -> Result<(FrameStats, bool), EngineError> {
+    pub fn render_frame_to_swapchain(
+        &mut self,
+        dt: f32,
+    ) -> Result<(FrameStats, bool), EngineError> {
         self.render_frame_to_swapchain_with_egui(dt, None)
     }
 
@@ -444,6 +578,7 @@ impl Engine {
         dt: f32,
         egui_ui: Option<(&egui::Context, egui::FullOutput)>,
     ) -> Result<(FrameStats, bool), EngineError> {
+        self.sync_render_resolution()?;
         let frame_idx = self.frame_index;
         let slot_idx = (frame_idx as usize) % FRAMES_IN_FLIGHT;
         let is_first = frame_idx == 0;
@@ -605,8 +740,7 @@ impl Engine {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_WRITE,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 color_subresource,
             )];
             unsafe {
@@ -761,8 +895,8 @@ impl Engine {
             cmd,
             gpu_scene,
             &self.gpu_instances_scratch,
-            self.width,
-            self.height,
+            self.render_width,
+            self.render_height,
             slot_idx,
             is_first,
         )?;
@@ -794,7 +928,7 @@ impl Engine {
                 frame_idx as f32,
                 1.0,
             ],
-            screen_size: [self.width, self.height],
+            screen_size: [self.render_width, self.render_height],
             light_count: self.world.lights.len() as u32,
             _pad: rt_flags,
         };
@@ -833,7 +967,13 @@ impl Engine {
         // 3. Hardware Ray Traced GI + Reflections
         let rt_pass = self.rt_pass.as_mut().expect("rt_pass");
         let p_rt = profiler.begin_pass(&self.rhi.device, cmd, "RayTraceGI");
-        rt_pass.record(&self.rhi.device, cmd, &gbuffer_pipe.targets, &rt_params, slot_idx)?;
+        rt_pass.record(
+            &self.rhi.device,
+            cmd,
+            &gbuffer_pipe.targets,
+            &rt_params,
+            slot_idx,
+        )?;
         profiler.end_pass(&self.rhi.device, cmd, p_rt);
 
         // 4. Spatiotemporal Denoiser (NVIDIA NRD or Built-in SVGF)
@@ -880,8 +1020,8 @@ impl Engine {
             cmd,
             &compose.out_hdr,
             out_img,
-            self.width,
-            self.height,
+            self.render_width,
+            self.render_height,
             slot_idx,
         );
         profiler.end_pass(&self.rhi.device, cmd, p_ml);

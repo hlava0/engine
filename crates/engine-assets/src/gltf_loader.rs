@@ -126,11 +126,7 @@ fn gltf_image_to_rgba8(img: &gltf::image::Data) -> TextureData {
             .iter()
             .flat_map(|c| [c[0], c[1], 0, 255])
             .collect(),
-        gltf::image::Format::R8 => img
-            .pixels
-            .iter()
-            .flat_map(|&g| [g, g, g, 255])
-            .collect(),
+        gltf::image::Format::R8 => img.pixels.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         _ => {
             // 16-bit or float formats: convert to 8-bit fallback
             let px_count = (img.width * img.height) as usize;
@@ -167,7 +163,9 @@ fn extract_scene(
                 roughness: pbr.roughness_factor(),
                 metallic: pbr.metallic_factor(),
                 emissive: mat.emissive_factor(),
-                albedo_texture: pbr.base_color_texture().map(|t| t.texture().source().index()),
+                albedo_texture: pbr
+                    .base_color_texture()
+                    .map(|t| t.texture().source().index()),
                 normal_texture: mat.normal_texture().map(|t| t.texture().source().index()),
                 metallic_roughness_texture: pbr
                     .metallic_roughness_texture()
@@ -293,21 +291,11 @@ fn extract_scene(
 
     if let Some(scene) = scene_opt {
         for root in scene.nodes() {
-            walk_node(
-                &root,
-                mat4_identity(),
-                &mesh_primitives,
-                &mut instances,
-            );
+            walk_node(&root, mat4_identity(), &mesh_primitives, &mut instances);
         }
     } else {
         for node in document.nodes() {
-            walk_node(
-                &node,
-                mat4_identity(),
-                &mesh_primitives,
-                &mut instances,
-            );
+            walk_node(&node, mat4_identity(), &mesh_primitives, &mut instances);
         }
     }
 

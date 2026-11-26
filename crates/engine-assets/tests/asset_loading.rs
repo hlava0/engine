@@ -9,11 +9,7 @@ use image::{ImageFormat, Rgba, RgbaImage};
 /// a PBR metallic-roughness + emissive material, and a translated node.
 fn build_minimal_glb() -> Vec<u8> {
     // 3 vertices (positions only, 3 * 12 = 36 bytes) + 3 u16 indices (6 bytes) -> padded to 44 bytes
-    let positions: [[f32; 3]; 3] = [
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ];
+    let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
     let indices: [u16; 3] = [0, 1, 2];
 
     let mut bin = Vec::new();
@@ -124,7 +120,11 @@ fn glb_in_memory_roundtrip() {
     assert_eq!(mesh.vertices[2].pos, [0.0, 1.0, 0.0]);
     // Flat normal computed for CCW triangle in XY plane should be +Z
     for v in &mesh.vertices {
-        assert!((v.normal[2] - 1.0).abs() < 1e-5, "Unexpected normal: {:?}", v.normal);
+        assert!(
+            (v.normal[2] - 1.0).abs() < 1e-5,
+            "Unexpected normal: {:?}",
+            v.normal
+        );
     }
     assert!(mesh.bounding_sphere[3] > 0.5);
 
@@ -183,7 +183,8 @@ fn png_decode_and_gpu_bindless_upload() {
     })
     .expect("RhiDevice::new");
 
-    let bindless = BindlessTable::new(&rhi.device, BindlessConfig::default()).expect("BindlessTable");
+    let bindless =
+        BindlessTable::new(&rhi.device, BindlessConfig::default()).expect("BindlessTable");
     let sampler_info = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
         .min_filter(vk::Filter::LINEAR)
@@ -191,7 +192,11 @@ fn png_decode_and_gpu_bindless_upload() {
         .address_mode_u(vk::SamplerAddressMode::REPEAT)
         .address_mode_v(vk::SamplerAddressMode::REPEAT)
         .address_mode_w(vk::SamplerAddressMode::REPEAT);
-    let sampler = unsafe { rhi.device.create_sampler(&sampler_info, None).expect("sampler") };
+    let sampler = unsafe {
+        rhi.device
+            .create_sampler(&sampler_info, None)
+            .expect("sampler")
+    };
 
     let pool = rhi
         .create_command_pool(

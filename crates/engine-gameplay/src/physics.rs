@@ -124,7 +124,10 @@ impl PhysicsWorld {
         }
 
         // 2. Register TriMesh colliders (static world geometry)
-        for (entity, (trimesh, tf)) in world.query::<(&TriMeshCollider, Option<&Transform>)>().iter() {
+        for (entity, (trimesh, tf)) in world
+            .query::<(&TriMeshCollider, Option<&Transform>)>()
+            .iter()
+        {
             if !self.trimesh_colliders.contains_key(&entity)
                 && !trimesh.vertices.is_empty()
                 && !trimesh.indices.is_empty()
@@ -157,7 +160,10 @@ impl PhysicsWorld {
             if let Some(&handle) = self.entity_to_body.get(&entity) {
                 if let Some(body) = self.rigid_body_set.get_mut(handle) {
                     // Sync external velocity / position edits (e.g. projectile impulses or editor nudges)
-                    body.set_linvel(vector![rb.velocity[0], rb.velocity[1], rb.velocity[2]], true);
+                    body.set_linvel(
+                        vector![rb.velocity[0], rb.velocity[1], rb.velocity[2]],
+                        true,
+                    );
                     body.set_position(Self::euler_to_iso(tf.position, tf.rotation_euler), true);
                     body.set_gravity_scale(if rb.use_gravity { 1.0 } else { 0.0 }, true);
                 }
@@ -175,7 +181,10 @@ impl PhysicsWorld {
                     .linvel(vector![rb.velocity[0], rb.velocity[1], rb.velocity[2]])
                     .gravity_scale(if rb.use_gravity { 1.0 } else { 0.0 });
                 let body_handle = self.rigid_body_set.insert(builder.build());
-                if let Some(c) = col.as_ref().and_then(|c| Self::build_collider(c, rb.restitution)) {
+                if let Some(c) = col
+                    .as_ref()
+                    .and_then(|c| Self::build_collider(c, rb.restitution))
+                {
                     self.collider_set
                         .insert_with_parent(c, body_handle, &mut self.rigid_body_set);
                 }
@@ -194,8 +203,16 @@ impl PhysicsWorld {
                 self.entity_to_body.get(&entity),
                 self.entity_to_body.get(&joint.other),
             ) {
-                let a1 = point![joint.anchor_self[0], joint.anchor_self[1], joint.anchor_self[2]];
-                let a2 = point![joint.anchor_other[0], joint.anchor_other[1], joint.anchor_other[2]];
+                let a1 = point![
+                    joint.anchor_self[0],
+                    joint.anchor_self[1],
+                    joint.anchor_self[2]
+                ];
+                let a2 = point![
+                    joint.anchor_other[0],
+                    joint.anchor_other[1],
+                    joint.anchor_other[2]
+                ];
                 let rapier_joint: GenericJoint = match joint.kind {
                     JointKind::Fixed => FixedJointBuilder::new()
                         .local_anchor1(a1)
@@ -208,9 +225,8 @@ impl PhysicsWorld {
                         .build()
                         .into(),
                     JointKind::Revolute { axis } => {
-                        let unit_axis = UnitVector::new_normalize(Vector3::new(
-                            axis[0], axis[1], axis[2],
-                        ));
+                        let unit_axis =
+                            UnitVector::new_normalize(Vector3::new(axis[0], axis[1], axis[2]));
                         RevoluteJointBuilder::new(unit_axis)
                             .local_anchor1(a1)
                             .local_anchor2(a2)
@@ -253,9 +269,8 @@ impl PhysicsWorld {
                 let rot = body.rotation();
                 let vel = body.linvel();
                 tf.position = [pos.x, pos.y, pos.z];
-                let q = UnitQuaternion::from_quaternion(Quaternion::new(
-                    rot.w, rot.i, rot.j, rot.k,
-                ));
+                let q =
+                    UnitQuaternion::from_quaternion(Quaternion::new(rot.w, rot.i, rot.j, rot.k));
                 tf.rotation_euler = Self::quat_to_euler(&q);
                 rb.velocity = [vel.x, vel.y, vel.z];
             }
@@ -263,7 +278,12 @@ impl PhysicsWorld {
     }
 
     /// Cast a ray against all physics colliders, returning `(hit_entity, hit_distance)`.
-    pub fn raycast(&self, origin: [f32; 3], dir: [f32; 3], max_toi: f32) -> Option<(Option<Entity>, f32)> {
+    pub fn raycast(
+        &self,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        max_toi: f32,
+    ) -> Option<(Option<Entity>, f32)> {
         let ray = Ray::new(
             point![origin[0], origin[1], origin[2]],
             vector![dir[0], dir[1], dir[2]],

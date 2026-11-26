@@ -42,7 +42,9 @@ fn main() {
         .include("ffi")
         .include(&ffx_include);
     if compat_h.exists() {
-        build.flag("-include").flag(compat_h.to_string_lossy().as_ref());
+        build
+            .flag("-include")
+            .flag(compat_h.to_string_lossy().as_ref());
     }
     build.file("ffi/fsr31_shim.cpp").compile("fsr31_shim");
 

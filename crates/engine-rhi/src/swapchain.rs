@@ -133,8 +133,12 @@ impl Swapchain {
     pub fn acquire_next_image(&self, frame_slot: usize) -> Result<(u32, bool)> {
         let sem = self.image_available_semaphore(frame_slot);
         match unsafe {
-            self.swapchain_loader
-                .acquire_next_image(self.swapchain, u64::MAX, sem, vk::Fence::null())
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                sem,
+                vk::Fence::null(),
+            )
         } {
             Ok((image_index, suboptimal)) => Ok((image_index, suboptimal)),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -264,9 +268,7 @@ fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     }
 }
 
-fn choose_composite_alpha(
-    supported: vk::CompositeAlphaFlagsKHR,
-) -> vk::CompositeAlphaFlagsKHR {
+fn choose_composite_alpha(supported: vk::CompositeAlphaFlagsKHR) -> vk::CompositeAlphaFlagsKHR {
     for candidate in [
         vk::CompositeAlphaFlagsKHR::OPAQUE,
         vk::CompositeAlphaFlagsKHR::INHERIT,

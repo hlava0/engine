@@ -31,7 +31,8 @@ impl SceneEditor {
     }
 
     fn sorted_entities(world: &World) -> Vec<Entity> {
-        let mut entities: Vec<Entity> = world.query::<&Transform>().iter().map(|(e, _)| e).collect();
+        let mut entities: Vec<Entity> =
+            world.query::<&Transform>().iter().map(|(e, _)| e).collect();
         entities.sort();
         entities
     }

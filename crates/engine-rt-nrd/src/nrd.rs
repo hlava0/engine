@@ -462,9 +462,8 @@ impl NrdBackend {
             }
             cbufs_slots.push(slot_cbufs);
         }
-        let cbufs: [Vec<GpuBuffer>; FRAMES_IN_FLIGHT] = cbufs_slots
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let cbufs: [Vec<GpuBuffer>; FRAMES_IN_FLIGHT] =
+            cbufs_slots.try_into().unwrap_or_else(|_| unreachable!());
 
         // Shared descriptor set layouts matching NRD's SPIR-V binding offsets
         let max_tex_slots = inst_info.per_set_textures_max_num.max(1);
@@ -658,12 +657,10 @@ impl NrdBackend {
             set1_slots.push(set1_list);
         }
 
-        let set0_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] = set0_slots
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
-        let set1_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] = set1_slots
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let set0_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] =
+            set0_slots.try_into().unwrap_or_else(|_| unreachable!());
+        let set1_per_slot: [Vec<vk::DescriptorSet>; FRAMES_IN_FLIGHT] =
+            set1_slots.try_into().unwrap_or_else(|_| unreachable!());
 
         let perm_states = vec![TrackedImageState::default(); perm_pool.len()];
         let trans_states = vec![TrackedImageState::default(); trans_pool.len()];
@@ -833,9 +830,8 @@ impl NrdBackend {
                 dst[..src.len()].copy_from_slice(src);
             }
 
-            let dd_res = unsafe {
-                std::slice::from_raw_parts(dd.resources, dd.resources_num as usize)
-            };
+            let dd_res =
+                unsafe { std::slice::from_raw_parts(dd.resources, dd.resources_num as usize) };
 
             let mut barriers: Vec<vk::ImageMemoryBarrier2<'_>> = Vec::with_capacity(dd_res.len());
             self.tex_infos_scratch.clear();
@@ -952,9 +948,8 @@ impl NrdBackend {
             let set0 = self.set0_per_slot[slot][d];
             let set1 = self.set1_per_slot[slot][d];
 
-            let mut writes = Vec::with_capacity(
-                self.tex_infos_scratch.len() + self.store_infos_scratch.len(),
-            );
+            let mut writes =
+                Vec::with_capacity(self.tex_infos_scratch.len() + self.store_infos_scratch.len());
             for (t, info) in self.tex_infos_scratch.iter().enumerate() {
                 writes.push(
                     vk::WriteDescriptorSet::default()
@@ -1067,7 +1062,9 @@ fn maybe_push_barrier<'a>(
     barriers: &mut Vec<vk::ImageMemoryBarrier2<'a>>,
 ) {
     let layout_changed = state.layout != req_layout;
-    let has_write_hazard = state.access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+    let has_write_hazard = state
+        .access
+        .contains(vk::AccessFlags2::SHADER_STORAGE_WRITE)
         || (req_access.contains(vk::AccessFlags2::SHADER_STORAGE_WRITE)
             && !state.access.is_empty());
 
@@ -1091,10 +1088,8 @@ fn maybe_push_barrier<'a>(
 #[cfg(has_nrd)]
 fn flatten_mat4(m: [[f32; 4]; 4]) -> [f32; 16] {
     [
-        m[0][0], m[0][1], m[0][2], m[0][3],
-        m[1][0], m[1][1], m[1][2], m[1][3],
-        m[2][0], m[2][1], m[2][2], m[2][3],
-        m[3][0], m[3][1], m[3][2], m[3][3],
+        m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1],
+        m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3],
     ]
 }
 

@@ -82,9 +82,9 @@ impl AccelStructureManager {
         }
 
         let max_instances = instances.len() as u32;
-        let inst_buf_size =
-            (max_instances as usize * std::mem::size_of::<vk::AccelerationStructureInstanceKHR>())
-                as vk::DeviceSize;
+        let inst_buf_size = (max_instances as usize
+            * std::mem::size_of::<vk::AccelerationStructureInstanceKHR>())
+            as vk::DeviceSize;
 
         let mut tlas_inst_vec = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for slot in 0..FRAMES_IN_FLIGHT {
@@ -97,9 +97,8 @@ impl AccelStructureManager {
                 MemoryLocation::CpuToGpu,
             )?);
         }
-        let mut tlas_instances_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] = tlas_inst_vec
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let mut tlas_instances_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] =
+            tlas_inst_vec.try_into().unwrap_or_else(|_| unreachable!());
         write_tlas_instances(&mut tlas_instances_buffers[0], instances, &blases)?;
 
         let tlas_geom = vk::AccelerationStructureGeometryKHR::default()
@@ -253,7 +252,11 @@ impl AccelStructureManager {
         }
 
         let slot = frame_slot % FRAMES_IN_FLIGHT;
-        write_tlas_instances(&mut self.tlas_instances_buffers[slot], instances, &self.blases)?;
+        write_tlas_instances(
+            &mut self.tlas_instances_buffers[slot],
+            instances,
+            &self.blases,
+        )?;
         let count = instances.len() as u32;
         let use_update = self.tlas_built_once
             && count == self.current_instances
@@ -501,14 +504,16 @@ fn write_tlas_instances(
 
     for (i, inst) in instances.iter().enumerate() {
         let blas = blases.get(inst.mesh_id as usize).ok_or_else(|| {
-            RtNrdError::InvalidConfig(format!("Instance {i} references invalid mesh_id {}", inst.mesh_id))
+            RtNrdError::InvalidConfig(format!(
+                "Instance {i} references invalid mesh_id {}",
+                inst.mesh_id
+            ))
         })?;
         let m = inst.model;
         let transform = vk::TransformMatrixKHR {
             matrix: [
-                m[0][0], m[1][0], m[2][0], m[3][0],
-                m[0][1], m[1][1], m[2][1], m[3][1],
-                m[0][2], m[1][2], m[2][2], m[3][2],
+                m[0][0], m[1][0], m[2][0], m[3][0], m[0][1], m[1][1], m[2][1], m[3][1], m[0][2],
+                m[1][2], m[2][2], m[3][2],
             ],
         };
         let as_inst = vk::AccelerationStructureInstanceKHR {
@@ -523,7 +528,10 @@ fn write_tlas_instances(
             },
         };
         let bytes = unsafe {
-            std::slice::from_raw_parts((&as_inst as *const vk::AccelerationStructureInstanceKHR).cast::<u8>(), elem_size)
+            std::slice::from_raw_parts(
+                (&as_inst as *const vk::AccelerationStructureInstanceKHR).cast::<u8>(),
+                elem_size,
+            )
         };
         let dst = &mut slice[i * elem_size..(i + 1) * elem_size];
         dst.copy_from_slice(bytes);

@@ -81,18 +81,24 @@ impl CoopMlPipeline {
 
         let (shader_name, req_subgroup_size, local_size_x) = match active_tile {
             CoopMatrixTile::M8N16K16 => {
-                log::info!("CoopMlPipeline: using VK_KHR_cooperative_matrix (8x16x16 FLOAT16 Intel XMX, SIMD16)");
+                log::info!(
+                    "CoopMlPipeline: using VK_KHR_cooperative_matrix (8x16x16 FLOAT16 Intel XMX, SIMD16)"
+                );
                 ("coop_ml_post.comp", Some(16u32), 32u32)
             }
             CoopMatrixTile::M16N16K16 => {
-                log::info!("CoopMlPipeline: using VK_KHR_cooperative_matrix (16x16x16 FLOAT16 Tensor/WMMA, Wave32)");
+                log::info!(
+                    "CoopMlPipeline: using VK_KHR_cooperative_matrix (16x16x16 FLOAT16 Tensor/WMMA, Wave32)"
+                );
                 ("coop_ml_post_16x16.comp", Some(32u32), 32u32)
             }
             CoopMatrixTile::Fallback => {
                 log::info!("CoopMlPipeline: using scalar compute fallback");
                 (
                     "coop_ml_fallback.comp",
-                    rhi.capabilities.vendor_profile.required_compute_subgroup_size,
+                    rhi.capabilities
+                        .vendor_profile
+                        .required_compute_subgroup_size,
                     8u32,
                 )
             }
@@ -115,8 +121,10 @@ impl CoopMlPipeline {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        let descriptor_set_layout =
-            unsafe { rhi.device.create_descriptor_set_layout(&set_layout_info, None)? };
+        let descriptor_set_layout = unsafe {
+            rhi.device
+                .create_descriptor_set_layout(&set_layout_info, None)?
+        };
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_IMAGE)
@@ -182,7 +190,9 @@ impl CoopMlPipeline {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             MemoryLocation::CpuToGpu,
         )?;
-        weight_buffer.mapped_slice_mut()?.copy_from_slice(bytemuck::bytes_of(&weights));
+        weight_buffer
+            .mapped_slice_mut()?
+            .copy_from_slice(bytemuck::bytes_of(&weights));
 
         Ok(Self {
             descriptor_set_layout,
@@ -380,8 +390,7 @@ impl CoopMlPipeline {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
-            device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
         }
         Ok(())
     }

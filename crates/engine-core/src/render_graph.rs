@@ -75,13 +75,7 @@ impl RenderGraph {
             let st = &mut self.resources[req.resource.0];
             if st.layout != req.layout || st.access != vk::AccessFlags2::NONE {
                 barriers.push(sync::image_barrier(
-                    st.image,
-                    st.layout,
-                    req.layout,
-                    st.stage,
-                    st.access,
-                    req.stage,
-                    req.access,
+                    st.image, st.layout, req.layout, st.stage, st.access, req.stage, req.access,
                     st.range,
                 ));
             }

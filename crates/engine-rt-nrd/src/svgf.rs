@@ -79,16 +79,40 @@ impl SvgfDenoiser {
         };
 
         let history_diff = [
-            make_hist(rhi.allocator_mut(), vk::Format::R16G16B16A16_SFLOAT, "svgf-hist-diff-0")?,
-            make_hist(rhi.allocator_mut(), vk::Format::R16G16B16A16_SFLOAT, "svgf-hist-diff-1")?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16G16B16A16_SFLOAT,
+                "svgf-hist-diff-0",
+            )?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16G16B16A16_SFLOAT,
+                "svgf-hist-diff-1",
+            )?,
         ];
         let history_spec = [
-            make_hist(rhi.allocator_mut(), vk::Format::R16G16B16A16_SFLOAT, "svgf-hist-spec-0")?,
-            make_hist(rhi.allocator_mut(), vk::Format::R16G16B16A16_SFLOAT, "svgf-hist-spec-1")?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16G16B16A16_SFLOAT,
+                "svgf-hist-spec-0",
+            )?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16G16B16A16_SFLOAT,
+                "svgf-hist-spec-1",
+            )?,
         ];
         let history_view_z = [
-            make_hist(rhi.allocator_mut(), vk::Format::R16_SFLOAT, "svgf-hist-viewz-0")?,
-            make_hist(rhi.allocator_mut(), vk::Format::R16_SFLOAT, "svgf-hist-viewz-1")?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16_SFLOAT,
+                "svgf-hist-viewz-0",
+            )?,
+            make_hist(
+                rhi.allocator_mut(),
+                vk::Format::R16_SFLOAT,
+                "svgf-hist-viewz-1",
+            )?,
         ];
 
         let nearest_sampler = unsafe {

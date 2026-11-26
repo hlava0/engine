@@ -60,9 +60,7 @@ impl GpuScene {
             rhi,
             "scene-indices",
             index_bytes,
-            vk::BufferUsageFlags::INDEX_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | as_input_flag,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | as_input_flag,
         )?;
         let mesh_buffer = create_and_upload_gpu_buffer(
             rhi,
@@ -77,8 +75,9 @@ impl GpuScene {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         )?;
 
-        let indirect_size =
-            (instance_count as usize * std::mem::size_of::<DrawIndexedIndirectCommand>()) as vk::DeviceSize;
+        let indirect_size = (instance_count as usize
+            * std::mem::size_of::<DrawIndexedIndirectCommand>())
+            as vk::DeviceSize;
         let indirect_draw_buffer = GpuBuffer::new(
             &device,
             rhi.allocator_mut(),
@@ -101,11 +100,11 @@ impl GpuScene {
                 MemoryLocation::GpuToCpu,
             )?);
         }
-        let draw_count_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] = draw_count_vec
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let draw_count_buffers: [GpuBuffer; FRAMES_IN_FLIGHT] =
+            draw_count_vec.try_into().unwrap_or_else(|_| unreachable!());
 
-        let draw_ids_size = (instance_count as usize * std::mem::size_of::<u32>()) as vk::DeviceSize;
+        let draw_ids_size =
+            (instance_count as usize * std::mem::size_of::<u32>()) as vk::DeviceSize;
         let draw_instance_ids_buffer = GpuBuffer::new(
             &device,
             rhi.allocator_mut(),

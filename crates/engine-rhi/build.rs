@@ -47,7 +47,9 @@ fn main() {
     }
     compiled.sort();
 
-    let mut registry = String::from("pub fn shader_spv_bytes(name: &str) -> Option<&'static [u8]> {\n    match name {\n");
+    let mut registry = String::from(
+        "pub fn shader_spv_bytes(name: &str) -> Option<&'static [u8]> {\n    match name {\n",
+    );
     for rel_str in &compiled {
         registry.push_str(&format!(
             "        {rel_str:?} => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/shaders/{rel_str}.spv\"))),\n"
@@ -76,7 +78,17 @@ fn compile_dir(
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let is_glsl = matches!(
             ext,
-            "comp" | "vert" | "frag" | "rgen" | "rmiss" | "rchit" | "rahit" | "rint" | "rcall" | "task" | "mesh"
+            "comp"
+                | "vert"
+                | "frag"
+                | "rgen"
+                | "rmiss"
+                | "rchit"
+                | "rahit"
+                | "rint"
+                | "rcall"
+                | "task"
+                | "mesh"
         );
         if !is_glsl {
             continue;

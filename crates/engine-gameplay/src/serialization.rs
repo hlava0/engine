@@ -92,6 +92,5 @@ pub fn save_scene_file<P: AsRef<Path>>(world: &World, path: P) -> std::io::Resul
 /// Load a `hecs::World` from a `.json` file on disk.
 pub fn load_scene_file<P: AsRef<Path>>(path: P) -> std::io::Result<World> {
     let json = std::fs::read_to_string(path)?;
-    scene_from_json(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    scene_from_json(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
